@@ -29,8 +29,32 @@ class Candidate:
         self.score, self.placement, self.routed, self.tag = score, placement, routed, tag
 
 
+_VALUE_NET_CACHE: dict = {}
+
+
+def _load_value_net(path: str = "models/value_sage.pt"):
+    """Load the trained GraphSAGE value net if one exists, else None."""
+    if path in _VALUE_NET_CACHE:
+        return _VALUE_NET_CACHE[path]
+    net = None
+    try:
+        import os
+        if os.path.exists(path):
+            import torch
+            from .gnn import ValueNet
+            ck = torch.load(path, map_location="cpu", weights_only=True)
+            net = ValueNet(hidden=ck.get("hidden", 64), layers=ck.get("layers", 3))
+            net.load_state_dict(ck["state_dict"])
+            net.eval()
+    except Exception:
+        net = None
+    _VALUE_NET_CACHE[path] = net
+    return net
+
+
 def solve(program: list[tuple], hardware_graph: nx.Graph, budget: float = 10.0,
-          seeds: int = 48, beam_width: int = 1200, verbose: bool = False):
+          seeds: int = 48, beam_width: int = 1200, verbose: bool = False,
+          value_net_path: str = "models/value_sage.pt"):
     """Returns (initial_placement, routed_program)."""
     t0 = time.monotonic()
     rng = random.Random(0xC0FFEE)
@@ -102,6 +126,19 @@ def solve(program: list[tuple], hardware_graph: nx.Graph, budget: float = 10.0,
                         incumbent=best.score if best else INF)
         if s is not None:
             offer(pl, s.ops(), f"beam/{tag}")
+
+    # -- learned value function, when a checkpoint is present ------------
+    net = _load_value_net(value_net_path)
+    if net is not None and scored_placements and time.monotonic() - t0 < budget:
+        from .gnn import make_value_fn
+        vf = make_value_fn(net, problem)
+        for _, tag, pl in scored_placements[:2]:
+            if time.monotonic() - t0 > budget * 1.4:
+                break
+            s = beam_search(problem, problem.initial(pl), width=beam_width,
+                            incumbent=best.score if best else INF, value_fn=vf)
+            if s is not None:
+                offer(pl, s.ops(), f"gnn-beam/{tag}")
 
     assert best is not None, "portfolio produced no valid candidate"
     return best.placement, best.routed
