@@ -99,7 +99,8 @@ class Problem:
             k += 1
         return State(pos, s.occ, tau, k, s.swaps, depth, chain)
 
-    def apply_swap(self, s: State, p: int, q: int) -> State:
+    def apply_swap_raw(self, s: State, p: int, q: int) -> State:
+        """Apply one SWAP without executing newly-enabled gates."""
         pos = list(s.pos)
         occ = list(s.occ)
         a, b = occ[p], occ[q]
@@ -111,9 +112,12 @@ class Problem:
         layer = 1 + max(s.tau[p], s.tau[q])
         tau = list(s.tau)
         tau[p] = tau[q] = layer
-        return self.advance(State(tuple(pos), tuple(occ), tuple(tau), s.k,
-                                  s.swaps + 1, max(s.depth, layer),
-                                  (s.chain, ("SWAP", p, q))))
+        return State(tuple(pos), tuple(occ), tuple(tau), s.k,
+                     s.swaps + 1, max(s.depth, layer),
+                     (s.chain, ("SWAP", p, q)))
+
+    def apply_swap(self, s: State, p: int, q: int) -> State:
+        return self.advance(self.apply_swap_raw(s, p, q))
 
     def actions(self, s: State) -> list[tuple[int, int]]:
         """SWAP candidates: edges incident to either qubit of the active gate."""
@@ -129,20 +133,24 @@ class Problem:
     def is_terminal(self, s: State) -> bool:
         return s.k >= self.n_ops
 
-    def heuristic(self, s: State, window: int = 12, weight: float = 0.5) -> float:
-        """Optimistic-ish cost-to-go: active gate distance plus decayed lookahead."""
+    def heuristic(self, s: State, window: int = 12, weight: float = 0.6,
+                  gamma: float = 0.8) -> float:
+        """Cost-to-go estimate: remaining gates, geometrically decayed.
+
+        A geometric decay is used rather than SABRE's flat mean so that the
+        imminent gates dominate; with a single-gate front layer a flat mean
+        lets distant gates outvote the one actually being routed.
+        """
         if s.k >= self.n_ops:
             return 0.0
-        _, a, b = self.ops[s.k]
-        d0 = self.d(s.pos[a], s.pos[b])
-        h = (d0 - 1) + 0.5 * ((d0 - 1 + 1) // 2)
-        tot, n = 0.0, 0
-        for j in range(s.k + 1, min(self.n_ops, s.k + 1 + window)):
+        h = 0.0
+        w = 1.0
+        for j in range(s.k, min(self.n_ops, s.k + window)):
             o = self.ops[j]
             if o[0] != "2Q":
                 continue
-            tot += max(0, self.d(s.pos[o[1]], s.pos[o[2]]) - 1)
-            n += 1
-        if n:
-            h += weight * tot / n
-        return h
+            d = self.d(s.pos[o[1]], s.pos[o[2]])
+            cost = max(0, d - 1) + 0.5 * ((max(0, d - 1) + 1) // 2)
+            h += w * cost
+            w *= gamma
+        return weight * h
