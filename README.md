@@ -278,6 +278,8 @@ qroute/
   collect.py             expert trajectories + sibling groups (multiprocess)
   train.py               ranking + value + decomposition training
   bounds.py              provable per-instance lower bounds
+  pipeline.py            one-command collect -> train -> distil -> score
+setup.sh                 venv + CUDA torch for a fresh Linux/NVIDIA box
   generate.py            random program generator / held-out test set
   eval.py                benchmark harness
 starter_kit/             organisers' code, vendored unmodified
@@ -285,29 +287,80 @@ starter_kit/             organisers' code, vendored unmodified
 
 ## Running it
 
+### Scoring
+
+Only `networkx` and `numpy` are needed to run the solver — `torch` is optional,
+and the portfolio skips the learned strategy when it is absent.
+
 ```bash
 pip install -r requirements.txt
 
 python -m qroute.eval                      # benchmark table
 python -m qroute.eval -v --only dense_random
 python submission.py                       # scores via the organisers' scorer
-```
-
-```bash
 python -m qroute.bounds                    # provable lower bounds
 ```
 
-Training the value net (not yet run):
+### Training
+
+One command builds the dataset and trains everything:
 
 ```bash
-# full run on one 5090
-python -m qroute.train --preset base --target-states 300000 --workers 12 --benchmark
+python -m qroute.pipeline
+```
 
-# add DAgger rounds on the net's own state distribution
+It collects 300k labelled states across every core, caches them to
+`runs/data.npz`, trains the 18M-parameter `base` net, distils a `small`
+student from it, and scores the six benchmarks through the real portfolio. The
+dataset cache is checked first, so an interrupted run resumes without paying
+for collection twice. `--dagger N` adds rounds on the net's own state
+distribution; each one re-collects, so budget the collection time again.
+
+#### On a fresh Linux box with an NVIDIA GPU
+
+```bash
+git clone https://github.com/arhamaamir1406/quantumania-submission
+cd quantumania-submission
+./setup.sh
+source .venv/bin/activate
+mkdir -p runs && python -m qroute.pipeline 2>&1 | tee runs/train.log
+```
+
+`setup.sh` was written against Arch Linux with an RTX 5090 and handles the two
+things that break a default install there:
+
+- **Blackwell needs CUDA 12.8+.** An RTX 50xx is compute capability `sm_120`,
+  and only cu128 wheels carry `sm_120` kernels. An older wheel still reports
+  `torch.cuda.is_available() == True` and then dies on the first matmul with
+  *no kernel image is available for execution on the device*. `pipeline.py`
+  therefore runs a real kernel at startup and refuses to begin on a wheel that
+  cannot execute one — a 20-minute collection is not a good time to discover
+  this. Override the channel with `CUDA_CHANNEL=cu129 ./setup.sh`.
+- **Arch tracks Python ahead of the PyTorch wheel index.** The script looks for
+  an interpreter in 3.10–3.13 and tells you what to install if there is none,
+  rather than letting pip resolve nothing or start a source build.
+
+Blackwell also needs driver 570 or newer (`nvidia` / `nvidia-open` on Arch);
+the script reports what `nvidia-smi` sees.
+
+#### Cost
+
+Collection is CPU-bound beam search, so cores set that stage's wall clock and
+the GPU is idle for it:
+
+| | |
+|---|---|
+| 300k states | ~38 min on 8 cores, ~19 min on 16 |
+| dataset on disk | ~90 MB compressed (`runs/data.npz`) |
+| dataset on GPU | ~700 MB fp16, plus ~290 MB model and optimiser |
+
+Individual stages, if you want them separately:
+
+```bash
+python -m qroute.train --preset base --target-states 300000 --benchmark
+python -m qroute.train --preset base --data runs/data.npz --epochs 90    # retrain, no re-collection
 python -m qroute.train --preset base --dagger 2 --resume models/value_base.pt
-
-# CPU-affordable student distilled from it
-python -m qroute.train --preset small --distill-from models/value_base.pt
+python -m qroute.train --preset small --distill-from models/value_base.pt --data runs/data.npz
 ```
 
 ## Still open

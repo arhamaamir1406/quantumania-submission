@@ -1,5 +1,17 @@
 networkx>=3.5,<4
 matplotlib>=3.10,<4
 numpy>=2.0
-# optional: only needed to train or use the RoutingNet value function
-torch>=2.4
+
+# torch is needed only to train or run the RoutingNet value function; the
+# portfolio runs without it and simply skips that strategy.
+#
+# Install torch FIRST, from the CUDA channel that matches your card -- a plain
+# `pip install torch` gives a CPU-only build on Windows, and on Linux it may
+# give a wheel with no kernels for your GPU. An RTX 50xx (Blackwell, sm_120)
+# needs CUDA 12.8 or newer:
+#
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+#
+# ./setup.sh does this for you. `python -m qroute.pipeline` verifies it by
+# running a real kernel before it starts, not just torch.cuda.is_available().
+torch>=2.7
