@@ -27,7 +27,7 @@ lost when it does not.
 
 Usage::
 
-    python -m qroute.train --preset base --programs 4000 --workers 12
+    python -m qroute.train --preset base --target-states 300000 --workers 12
     python -m qroute.train --preset base --dagger 2 --resume models/value_base.pt
     python -m qroute.train --preset small --distill-from models/value_base.pt
 """
@@ -240,15 +240,19 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     # data
-    ap.add_argument("--programs", type=int, default=3000)
+    ap.add_argument("--target-states", type=int, default=300_000,
+                    help="dataset size in labelled states (the primary knob)")
+    ap.add_argument("--programs", type=int, default=10 ** 9,
+                    help="safety cap on programs; --target-states normally binds first")
     ap.add_argument("--workers", type=int, default=0, help="0 = cpu_count-1")
     ap.add_argument("--teacher-width", type=int, default=400)
     ap.add_argument("--label-width", type=int, default=60)
     ap.add_argument("--max-paths", type=int, default=12)
-    ap.add_argument("--groups-per-program", type=int, default=4)
+    ap.add_argument("--groups-per-program", type=int, default=6)
     ap.add_argument("--siblings", type=int, default=8)
     ap.add_argument("--max-qubits", type=int, default=20)
-    ap.add_argument("--collect-cap", type=float, default=7200.0)
+    ap.add_argument("--collect-cap", type=float, default=14400.0,
+                    help="per-worker wall-clock cap on collection, seconds")
     ap.add_argument("--data", default=None, help="reuse a saved .npz dataset")
     ap.add_argument("--save-data", default=None)
     ap.add_argument("--dagger", type=int, default=0,
@@ -264,7 +268,7 @@ def main():
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--groups-per-batch", type=int, default=48)
     ap.add_argument("--singles-per-batch", type=int, default=256)
-    ap.add_argument("--steps-per-epoch", type=int, default=400)
+    ap.add_argument("--steps-per-epoch", type=int, default=600)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--wd", type=float, default=0.01)
     ap.add_argument("--warmup", type=float, default=0.05)
@@ -327,9 +331,10 @@ def main():
             print(f"  {len(shard)} states")
         else:
             drive = str(out_path) if rnd > 0 and out_path.exists() else None
-            print(f"[round {rnd}] collecting {args.programs} programs on "
+            print(f"[round {rnd}] collecting {args.target_states:,} states on "
                   f"{args.workers} workers" + (f", driven by {drive}" if drive else ""))
-            shard = collect(args.programs, seed=args.seed + 31 * rnd,
+            shard = collect(args.programs, target_states=args.target_states,
+                            seed=args.seed + 31 * rnd,
                             max_qubits=args.max_qubits,
                             teacher_width=args.teacher_width,
                             label_width=args.label_width, max_paths=args.max_paths,

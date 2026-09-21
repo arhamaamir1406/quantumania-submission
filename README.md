@@ -154,6 +154,27 @@ cost-to-go. `--dagger N` then re-collects from the current net's own rollouts,
 which fixes the standard failure of pure imitation — the expert never visits
 the states the student's mistakes lead to.
 
+Dataset size is requested in **states**, not programs (`--target-states`,
+default 300k): yield per program swings by an order of magnitude across the
+families, since a 5-gate chain and an 80-gate dense instance are drawn with
+equal probability. At the defaults that is ~10.5k programs, of which
+
+| | |
+|---|---|
+| states / program | 28.4 |
+| in ranking groups | 60% (~29k groups, avg 3.7 members) |
+| trajectory states | 40% |
+| collection | ~38 min on 8 cores, ~19 min on 16 |
+| resident on GPU | ~700 MB (fp16) + ~290 MB model and optimiser |
+
+Programs are synthetic (`qroute/generate.py`): eight families — star, chain,
+ladder, brickwork, sparse, dense, tree, cycle — sampled uniformly over 6–20
+logical qubits, on the one 20-qubit hardware graph. The six public benchmarks
+are **not** among them; the families mirror their shapes, plus two the
+benchmarks do not contain. Labels are the teacher's cost-to-go, so they are
+upper bounds rather than optima: the net can beat the teacher by ordering
+better under a wider beam, but the value *scale* is anchored to beam quality.
+
 States are recorded at **gate-round boundaries**, exactly the states
 `beam_search` scores, so the training distribution matches the inference one.
 Validation is split by program, never by state. The headline validation metric
@@ -280,7 +301,7 @@ Training the value net (not yet run):
 
 ```bash
 # full run on one 5090
-python -m qroute.train --preset base --programs 4000 --workers 12 --benchmark
+python -m qroute.train --preset base --target-states 300000 --workers 12 --benchmark
 
 # add DAgger rounds on the net's own state distribution
 python -m qroute.train --preset base --dagger 2 --resume models/value_base.pt

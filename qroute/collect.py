@@ -223,43 +223,58 @@ def collect_one(prog, hw, rng, acc: _Accumulator, prog_id: int, *,
     return len(acc.rows["base_cost"]) - before
 
 
-def _worker(args):
-    """One process: collect from a slice of the program stream."""
-    (seed, n_programs, max_qubits, teacher_width, label_width, max_paths,
-     groups_per_program, siblings, time_cap, net_path, device, quantile,
-     prog_offset) = args
+def _worker(job: dict):
+    """One process: collect until it hits its share of the state target."""
     hw = build_hardware_graph()
-    rng = random.Random(seed)
+    rng = random.Random(job["seed"])
     acc = _Accumulator()
+    wid = job["wid"]
+    target = job["target_states"]
+    cap = job["n_programs"]
 
     factory = None
+    net_path = job["net_path"]
     if net_path and os.path.exists(net_path):
         try:
             import torch  # noqa: F401
             from .gnn import load_net, make_value_fn
-            net = load_net(net_path, device)
+            net = load_net(net_path, job["device"])
             if net is not None:
                 def factory(problem, _net=net):
-                    return make_value_fn(_net, problem, device=device,
-                                         quantile=quantile, max_batch=256)
+                    return make_value_fn(_net, problem, device=job["device"],
+                                         quantile=job["quantile"], max_batch=256)
         except Exception:
             factory = None
 
     t0 = time.monotonic()
+    last = t0
     made = 0
-    while made < n_programs and time.monotonic() - t0 < time_cap:
-        kind, prog = random_program(rng, max_qubits)
+    while made < cap:
+        now = time.monotonic()
+        if now - t0 > job["time_cap"]:
+            break
+        if target and len(acc.rows["base_cost"]) >= target:
+            break
+        kind, prog = random_program(rng, job["max_qubits"])
         if not prog:
             continue
         try:
-            collect_one(prog, hw, rng, acc, prog_offset + made,
-                        teacher_width=teacher_width, label_width=label_width,
-                        max_paths=max_paths,
-                        groups_per_program=groups_per_program,
-                        siblings=siblings, value_fn_factory=factory)
+            collect_one(prog, hw, rng, acc, made,
+                        teacher_width=job["teacher_width"],
+                        label_width=job["label_width"],
+                        max_paths=job["max_paths"],
+                        groups_per_program=job["groups_per_program"],
+                        siblings=job["siblings"], value_fn_factory=factory)
         except Exception:
             pass
         made += 1
+        if job["progress"] and now - last > job["progress"]:
+            last = now
+            got = len(acc.rows["base_cost"])
+            frac = f"/{target}" if target else ""
+            rate = got / max(1e-6, now - t0)
+            print(f"    [w{wid}] {got}{frac} states, {made} programs, "
+                  f"{now - t0:.0f}s ({rate:.0f} states/s)", flush=True)
     return acc.shard()
 
 
@@ -277,27 +292,38 @@ def _spawn_safe() -> bool:
     return bool(path) and os.path.exists(path)
 
 
-def collect(n_programs: int, *, seed: int = 7, max_qubits: int = 20,
+def collect(n_programs: int = 10 ** 9, *, target_states: int | None = None,
+            seed: int = 7, max_qubits: int = 20,
             teacher_width: int = 400, label_width: int = 60, max_paths: int = 12,
             groups_per_program: int = 4, siblings: int = 8,
             time_cap: float = 3600.0, workers: int = 0,
             net_path: str | None = None, device: str = "cpu",
-            quantile: int | None = None, verbose: bool = True) -> Shard:
-    """Generate a dataset, optionally across `workers` processes."""
-    workers = workers or 1
-    per = max(1, n_programs // workers)
-    jobs = [(seed + 1000 * w, per, max_qubits, teacher_width, label_width,
-             max_paths, groups_per_program, siblings, time_cap, net_path,
-             device, quantile, w * per) for w in range(workers)]
+            quantile: int | None = None, verbose: bool = True,
+            progress: float = 60.0) -> Shard:
+    """Generate a dataset across `workers` processes.
 
+    Prefer `target_states` to `n_programs`: yield per program swings by an
+    order of magnitude across the program families (a 5-gate chain and an
+    80-gate dense instance are both drawn uniformly), so a program count is a
+    poor way to ask for a dataset size. With a target, each worker collects its
+    share and stops; `n_programs` and `time_cap` remain as safety caps.
+    """
+    workers = workers or 1
     if workers > 1 and not _spawn_safe():
         if verbose:
             print("  [collect] __main__ is not importable by spawned workers "
                   "(stdin/REPL/notebook); falling back to a single process")
-        jobs = [(seed, n_programs, max_qubits, teacher_width, label_width,
-                 max_paths, groups_per_program, siblings, time_cap, net_path,
-                 device, quantile, 0)]
         workers = 1
+
+    share = (target_states + workers - 1) // workers if target_states else None
+    base = dict(max_qubits=max_qubits, teacher_width=teacher_width,
+                label_width=label_width, max_paths=max_paths,
+                groups_per_program=groups_per_program, siblings=siblings,
+                time_cap=time_cap, net_path=net_path, device=device,
+                quantile=quantile, target_states=share,
+                n_programs=max(1, n_programs // workers),
+                progress=progress if verbose else 0.0)
+    jobs = [dict(base, seed=seed + 1000 * w, wid=w) for w in range(workers)]
 
     t0 = time.monotonic()
     if workers == 1:
