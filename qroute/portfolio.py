@@ -3,9 +3,15 @@
 Because the scorer is available and cheap, there is no reason to ever ship a
 strategy that loses on a given instance. The baseline is kept in the portfolio
 as a safety net, so the result can never be worse than it, and never invalid.
+
+The learned value function is one portfolio member among several, and it is
+admitted on exactly the same terms as the rest: it wins an instance only if it
+self-scores better. A regression in the net can cost search time; it can never
+cost score.
 """
 from __future__ import annotations
 
+import os
 import random
 import time
 
@@ -13,13 +19,19 @@ import networkx as nx
 
 from starter_kit.baseline_routing import solve as baseline_solve
 
-from .ir import evaluate, materialize
+from .ir import evaluate
 from .mdp import Problem
 from .placement import (constructive_placement, embed_placement,
                         identity_placement, random_placement)
 from .search import beam_search, greedy_rollout
 
 INF = float("inf")
+
+# Checkpoints are tried in order; the first that loads wins. The small net is
+# listed first on CPU because an 18M-parameter forward pass over a 1200-wide
+# beam does not fit in a 10-second budget without a GPU.
+CHECKPOINTS_GPU = ("models/value_large.pt", "models/value_base.pt", "models/value_small.pt")
+CHECKPOINTS_CPU = ("models/value_small.pt", "models/value_tiny.pt", "models/value_base.pt")
 
 
 class Candidate:
@@ -29,37 +41,53 @@ class Candidate:
         self.score, self.placement, self.routed, self.tag = score, placement, routed, tag
 
 
-_VALUE_NET_CACHE: dict = {}
+_NET_CACHE: dict = {}
 
 
-def _load_value_net(path: str = "models/value_sage.pt"):
-    """Load the trained GraphSAGE value net if one exists, else None."""
-    if path in _VALUE_NET_CACHE:
-        return _VALUE_NET_CACHE[path]
-    net = None
+def _pick_device(requested: str | None) -> str:
+    if requested:
+        return requested
     try:
-        import os
-        if os.path.exists(path):
-            import torch
-            from .gnn import ValueNet
-            ck = torch.load(path, map_location="cpu", weights_only=True)
-            net = ValueNet(hidden=ck.get("hidden", 64), layers=ck.get("layers", 3))
-            net.load_state_dict(ck["state_dict"])
-            net.eval()
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
+def load_value_net(device: str, paths: tuple[str, ...] | None = None):
+    """Load the best available checkpoint for `device`, or None."""
+    key = (device, paths)
+    if key in _NET_CACHE:
+        return _NET_CACHE[key]
+    net = None
+    if paths is None:
+        paths = CHECKPOINTS_GPU if device.startswith("cuda") else CHECKPOINTS_CPU
+    try:
+        from .gnn import load_net
+        for p in paths:
+            if os.path.exists(p):
+                net = load_net(p, device)
+                if net is not None:
+                    break
     except Exception:
         net = None
-    _VALUE_NET_CACHE[path] = net
+    _NET_CACHE[key] = net
     return net
 
 
 def solve(program: list[tuple], hardware_graph: nx.Graph, budget: float = 10.0,
           seeds: int = 48, beam_width: int = 1200, verbose: bool = False,
-          value_net_path: str = "models/value_sage.pt"):
+          net=None, net_device: str | None = None, net_quantile: int | None = None,
+          net_beam: int | None = None, net_paths: tuple[str, ...] | None = None,
+          use_net: bool = True):
     """Returns (initial_placement, routed_program)."""
     t0 = time.monotonic()
     rng = random.Random(0xC0FFEE)
     problem = Problem(program, hardware_graph)
     best: Candidate | None = None
+
+    def left():
+        return budget - (time.monotonic() - t0)
 
     def offer(placement, ops, tag):
         nonlocal best
@@ -80,10 +108,9 @@ def solve(program: list[tuple], hardware_graph: nx.Graph, budget: float = 10.0,
     from starter_kit.scorer import core_score, validate_routed_program
     ok, _ = validate_routed_program(program, hardware_graph, bpl, brouted)
     if ok:
-        c = Candidate(core_score(brouted), bpl, brouted, "baseline")
-        best = c
+        best = Candidate(core_score(brouted), bpl, brouted, "baseline")
         if verbose:
-            print(f"    [baseline] {c.score:.1f}")
+            print(f"    [baseline] {best.score:.1f}")
 
     # -- zero-SWAP embedding ---------------------------------------------
     emb = embed_placement(program, hardware_graph)
@@ -101,17 +128,19 @@ def solve(program: list[tuple], hardware_graph: nx.Graph, budget: float = 10.0,
         if time.monotonic() - t0 > budget * 0.55:
             break
         if i % 3 == 0:
-            p = constructive_placement(program, hardware_graph, rng, jitter=1.5)
-            placements.append((f"constructive-j{i}", p))
+            placements.append((f"constructive-j{i}",
+                               constructive_placement(program, hardware_graph, rng, jitter=1.5)))
         else:
-            placements.append((f"random{i}", random_placement(program, hardware_graph, rng)))
+            placements.append((f"random{i}",
+                               random_placement(program, hardware_graph, rng)))
 
     scored_placements = []
     for tag, pl in placements:
         if time.monotonic() - t0 > budget * 0.7:
             break
         s = greedy_rollout(problem, problem.initial(pl), rng=rng,
-                           noise=0.0 if tag.startswith(("constructive", "identity", "embed")) else 0.15)
+                           noise=0.0 if tag.startswith(("constructive", "identity", "embed"))
+                           else 0.15)
         if s is None:
             continue
         scored_placements.append((s.cost, tag, pl))
@@ -127,18 +156,37 @@ def solve(program: list[tuple], hardware_graph: nx.Graph, budget: float = 10.0,
         if s is not None:
             offer(pl, s.ops(), f"beam/{tag}")
 
-    # -- learned value function, when a checkpoint is present ------------
-    net = _load_value_net(value_net_path)
-    if net is not None and scored_placements and time.monotonic() - t0 < budget:
-        from .gnn import make_value_fn
-        vf = make_value_fn(net, problem)
-        for _, tag, pl in scored_placements[:2]:
-            if time.monotonic() - t0 > budget * 1.4:
-                break
-            s = beam_search(problem, problem.initial(pl), width=beam_width,
-                            incumbent=best.score if best else INF, value_fn=vf)
-            if s is not None:
-                offer(pl, s.ops(), f"gnn-beam/{tag}")
+    # -- learned value function ------------------------------------------
+    if use_net and scored_placements:
+        device = _pick_device(net_device)
+        if net is None:
+            net = load_value_net(device, net_paths)
+        if net is not None:
+            try:
+                from .gnn import make_value_fn
+                vf = make_value_fn(net, problem, device=device, quantile=net_quantile,
+                                   max_batch=1024 if device.startswith("cuda") else 256)
+                # An 18M-parameter net is ~3ms/state on CPU and ~30us on a GPU,
+                # so the affordable beam width differs by two orders of magnitude.
+                width = net_beam if net_beam is not None else (
+                    beam_width if device.startswith("cuda") else max(16, beam_width // 24))
+                for _, tag, pl in scored_placements[:2]:
+                    if left() <= 0:
+                        break
+                    s = beam_search(problem, problem.initial(pl), width=width,
+                                    incumbent=best.score if best else INF, value_fn=vf)
+                    if s is not None:
+                        offer(pl, s.ops(), f"net-beam/{tag}")
+                # A greedy rollout under the net is cheap and sometimes escapes
+                # a beam that the incumbent pruned too aggressively.
+                if left() > 0 and scored_placements:
+                    _, tag, pl = scored_placements[0]
+                    s = greedy_rollout(problem, problem.initial(pl), value_fn=vf)
+                    if s is not None:
+                        offer(pl, s.ops(), f"net-greedy/{tag}")
+            except Exception as exc:                       # never let the net break a run
+                if verbose:
+                    print(f"    [net] skipped: {exc}")
 
     assert best is not None, "portfolio produced no valid candidate"
     return best.placement, best.routed

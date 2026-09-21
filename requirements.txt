@@ -1,5 +1,5 @@
 networkx>=3.5,<4
 matplotlib>=3.10,<4
 numpy>=2.0
-# optional: only needed to train or use the GraphSAGE value function
+# optional: only needed to train or use the RoutingNet value function
 torch>=2.4

@@ -3,3 +3,7 @@ __pycache__/
 .venv/
 runs/
 *.json.gz
+
+# collected training datasets (regenerable; checkpoints under models/ are NOT
+# ignored -- the trained weights are part of the submission)
+*.npz
