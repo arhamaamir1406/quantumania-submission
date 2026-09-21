@@ -263,6 +263,20 @@ def _worker(args):
     return acc.shard()
 
 
+def _spawn_safe() -> bool:
+    """Can `multiprocessing` with the spawn start method re-import __main__?
+
+    On Windows every worker re-imports the parent's __main__ by path. If the
+    session was started from stdin, a REPL, or a notebook there is no such
+    path, and each worker fails *and respawns*. Falling back to one process is
+    far better than that.
+    """
+    import sys
+    main = sys.modules.get("__main__")
+    path = getattr(main, "__file__", None)
+    return bool(path) and os.path.exists(path)
+
+
 def collect(n_programs: int, *, seed: int = 7, max_qubits: int = 20,
             teacher_width: int = 400, label_width: int = 60, max_paths: int = 12,
             groups_per_program: int = 4, siblings: int = 8,
@@ -275,6 +289,15 @@ def collect(n_programs: int, *, seed: int = 7, max_qubits: int = 20,
     jobs = [(seed + 1000 * w, per, max_qubits, teacher_width, label_width,
              max_paths, groups_per_program, siblings, time_cap, net_path,
              device, quantile, w * per) for w in range(workers)]
+
+    if workers > 1 and not _spawn_safe():
+        if verbose:
+            print("  [collect] __main__ is not importable by spawned workers "
+                  "(stdin/REPL/notebook); falling back to a single process")
+        jobs = [(seed, n_programs, max_qubits, teacher_width, label_width,
+                 max_paths, groups_per_program, siblings, time_cap, net_path,
+                 device, quantile, 0)]
+        workers = 1
 
     t0 = time.monotonic()
     if workers == 1:
