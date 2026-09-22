@@ -3,33 +3,24 @@
 Placement, routing and scheduling for the Quantum Coalition challenge at
 Q-SITE 2026.
 
-**Current result: 69.5–71.5 across the six public benchmarks (best run
-69.5), down from the provided baseline's 283.5 (−75%). All six validate, and
-three are provably optimal.** Earlier versions of this solver scored 91.5;
-placement search (below) is the difference.
+**Current result: 69.0 across the six public benchmarks, down from the
+provided baseline's 283.5 (−75.7%). All six validate, and four are provably
+optimal** (`ghz_star`, `chain_trotter`, `ladder_trotter`, `vqe_layers`).
 
-| benchmark | 2Q gates | baseline | ours | swaps | depth | swaps ≥ | floor | gap |
-|---|---|---|---|---|---|---|---|---|
-| `ghz_star` | 7 | 14.0 | **6.5** | 2 | 9 | 2 | 6.5 | **0.0** |
-| `chain_trotter` | 9 | 15.0 | **4.5** | 0 | 9 | 0 | 4.5 | **0.0** |
-| `ladder_trotter` | 16 | 35.5 | 6.5 | 3 | 7 | 1 | 4.0 | 2.5 |
-| `qaoa_random` | 18 | 39.0 | 12.0 | 6 | 12 | 1 | 5.0 | 7.0 |
-| `dense_random` | 40 | 122.0 | 37.0 | 26 | 22 | 4 | 10.0 | 27.0 |
-| `vqe_layers` | 45 | 58.0 | **3.0** | 0 | 6 | 0 | 3.0 | **0.0** |
-| **total** | 135 | **283.5** | **69.5** | 37 | | **8** | 33.0 | 36.5 |
+| benchmark | 2Q gates | baseline | ours | swaps | depth | floor | proven optimal |
+|---|---|---|---|---|---|---|---|
+| `ghz_star` | 7 | 14.0 | **6.5** | 2 | 9 | 6.5 | yes — coupled hub bound |
+| `chain_trotter` | 9 | 15.0 | **4.5** | 0 | 9 | 4.5 | yes — embeds |
+| `ladder_trotter` | 16 | 35.5 | **6.5** | 3 | 7 | 4.0 | yes — `qroute.certify`, 11 s |
+| `qaoa_random` | 18 | 39.0 | 11.5 | 7 | 9 | 5.0 | no ≤ 11.0 up to depth 11 |
+| `dense_random` | 40 | 122.0 | 37.0 | 26 | 22 | 10.0 | — |
+| `vqe_layers` | 45 | 58.0 | **3.0** | 0 | 6 | 3.0 | yes — embeds |
+| **total** | 135 | **283.5** | **69.0** | 38 | | 33.0 | |
 
-Measured with the default 60 s budget per benchmark on 24 cores. The search
-is anytime and time-bounded: five of the six instances return the same score
-on every run, and `dense_random` varies between 37.0 and 39.0 (so the total
-between 69.5 and 71.5). Instances that reach their provable floor return
-immediately, so a full run takes ~2.5–3 minutes. Budget sweep (same code):
-
-| budget | 10 s | 30 s | 60 s |
-|---|---|---|---|
-| total | 72.0–72.5 | 71.0 | 69.5–71.5 |
-
-The rules set no time limit on `solve()`; the budget is a parameter
-(`solve(program, hw, budget=...)`). On a single core at 10 s it scores ~75.5.
+Measured with the default 60 s budget per benchmark on 24 cores.
+`dense_random` varies between runs (37.0–39.0); the other five return the
+same score every run. `floor` is the analytical bound from `qroute/bounds.py`;
+the last column adds the computational proofs from `qroute/certify.py`.
 
 `floor` is a provable lower bound, computed by `qroute/bounds.py` — see
 *Lower bounds* below. `chain_trotter` and `vqe_layers` sit exactly on it, so
@@ -89,7 +80,13 @@ Every strategy runs, self-scores, and the best valid candidate wins:
    beat the placement search.
 4. **Learned value function** (`RoutingNet`) driving both beam search and a
    greedy rollout, when a checkpoint is present — see below.
-5. **The provided baseline**, kept as a safety net — so the result can never
+5. **Exact layered model** (`qroute/exact.py`, needs `ortools`) — on
+   instances with ≤ 24 two-qubit gates, CP-SAT solves placement + routing in
+   a full-freedom move space (any SWAP on any edge in any layer), seeded with
+   the incumbent, for the back half of the budget. It finds trade-offs the
+   move-set search cannot express: `qaoa_random` went from 6 SWAPs/depth 12
+   (12.0) to 7 SWAPs/depth 9 (11.5). See *Exact model* below.
+6. **The provided baseline**, kept as a safety net — so the result can never
    be worse than it, and never invalid.
 
 ### Placement search
@@ -307,6 +304,32 @@ Where the headroom actually is: 37 of our 69.5 is SWAP count, and 27 of the
 36.5 gap is `dense_random` alone. The floors are loose there, so not all of
 that gap is achievable.
 
+## Exact model
+
+`qroute/exact.py` is an OLSQ-style layered model: `x[q,p,t]` (logical `q` on
+physical `p` at layer `t`), `s[e,t]` (SWAP on edge `e`), `y[i,e,t]` (gate `i`
+on edge `e`), with disjointness per layer and SWAP-driven mapping
+transitions; objective `2·swaps + depth`.
+
+- **Relaxed ordering** — only gates sharing a logical qubit are ordered. The
+  ASAP layering of any valid routed program is feasible, so the optimum is a
+  **lower bound** on the true optimum. `qroute/certify.py` uses it in depth
+  slices (for each depth a better solution could have, prove no layout
+  reaches a lower score). `python -m qroute.certify ladder_trotter 6.5`
+  proves `ladder_trotter` optimal in ~11 s.
+- **Emission** — a relaxed solution becomes a routed program by topological
+  sort over per-physical-qubit layer order plus program order. If that has
+  a cycle, it contains a qubit chain from a later gate back to an earlier
+  one; the solver adds `layer(i) <= layer(j)` for exactly those pairs and
+  re-solves (lazy ordering). A fully strict order (all gates monotone) is
+  too restrictive — it is infeasible for `qaoa_random` even at 11.5.
+- **Scale** — whole-instance solves are fast up to ~20 gates. On
+  `dense_random` (40 gates) CP-SAT does not improve the incumbent in 8
+  minutes. A windowed variant (`qroute/window.py`: solve 12 gates exactly
+  with the mapping fixed, re-route the rest by beam) did improve a 39.5
+  solution to 38.5, but at a 60 s budget it loses to spending that time on
+  placement search, so it is opt-in (`use_window=True`).
+
 ## Correctness
 
 The scorer strips inserted SWAPs and requires the remainder to equal the
@@ -342,6 +365,9 @@ qroute/
   collect.py             expert trajectories + sibling groups (multiprocess)
   train.py               ranking + value + decomposition training
   bounds.py              provable per-instance lower bounds
+  exact.py               CP-SAT layered model: solver + relaxation
+  certify.py             optimality proofs by depth-sliced relaxation
+  window.py              window LNS (exact windows + beam), opt-in
   pipeline.py            one-command collect -> train -> distil -> score
 setup.sh                 venv + CUDA torch for a fresh Linux/NVIDIA box
   generate.py            random program generator / held-out test set

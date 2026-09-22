@@ -35,6 +35,18 @@ CHECKPOINTS_GPU = ("models/value_large.pt", "models/value_base.pt", "models/valu
 CHECKPOINTS_CPU = ("models/value_small.pt", "models/value_tiny.pt", "models/value_base.pt")
 
 
+def _to_ir(routed: list[tuple]) -> list[tuple]:
+    """Physical routed program -> IR ops (SWAPs kept, program ops indexed)."""
+    out, k = [], 0
+    for op in routed:
+        if op[0] == "SWAP":
+            out.append(op)
+        else:
+            out.append(("GATE", k))
+            k += 1
+    return out
+
+
 class _Optimal(Exception):
     """Raised by offer() when a candidate reaches the provable floor."""
 
@@ -85,13 +97,27 @@ def solve(program: list[tuple], hardware_graph: nx.Graph, budget: float = 10.0,
           net=None, net_device: str | None = None, net_quantile: int | None = None,
           net_beam: int | None = None, net_paths: tuple[str, ...] | None = None,
           use_net: bool = True, placement_share: float = 0.65,
-          polish_share: float = 0.9, workers: int | None = None, seed: int = 0xC0FFEE):
+          polish_share: float = 0.9, workers: int | None = None, seed: int = 0xC0FFEE,
+          use_exact: bool = True, exact_max_gates: int = 24, exact_share: float = 0.5,
+          use_window: bool = False, window_share: float = 0.4, window_size: int = 12):
     """Returns (initial_placement, routed_program)."""
     t0 = time.monotonic()
     rng = random.Random(seed)
     problem = Problem(program, hardware_graph)
     best: Candidate | None = None
     floor = score_lower_bound(program, hardware_graph)[0]
+    # Hand the back part of the budget to the exact model: whole-instance on
+    # small programs, window LNS on large ones.
+    if use_exact:
+        try:
+            from . import exact
+            if exact.available():
+                small = sum(1 for op in program if op[0] == "2Q") <= exact_max_gates
+                share = exact_share if small else (window_share if use_window else 0.0)
+                placement_share *= 1 - share
+                polish_share *= 1 - share
+        except ImportError:
+            pass
 
     def left():
         return budget - (time.monotonic() - t0)
@@ -158,6 +184,52 @@ def solve(program: list[tuple], hardware_graph: nx.Graph, budget: float = 10.0,
         polish(problem, [pl for _, pl in top], deadline=t0 + budget * polish_share,
                incumbent=best.score if best else INF,
                on_improve=lambda pl, ops: offer(pl, ops, f"polish/{tags[tuple(sorted(pl.items()))]}"))
+
+        # -- exact layered model (CP-SAT), seeded with the incumbent --------
+        # A different search space: any SWAP on any edge in any layer. It
+        # finds trade-offs the move-set search cannot express (qaoa_random:
+        # 6 SWAPs/depth 12 -> 7 SWAPs/depth 9). Optional, like torch.
+        if use_exact and best is not None and left() > 2:
+            try:
+                from . import exact
+                n2q = sum(1 for op in program if op[0] == "2Q")
+                if exact.available() and n2q <= exact_max_gates:
+                    ops = _to_ir(best.routed)
+                    _, T = exact.hint_layers(program, hardware_graph, best.placement, ops,
+                                             monotone=False)
+                    # Room for trade-offs that spend depth to save SWAPs, capped
+                    # by the deepest solution that could still beat the incumbent.
+                    s_floor = score_lower_bound(program, hardware_graph)[1]
+                    T = max(1, min(T + 2, int(2 * (best.score - 0.5 - s_floor))))
+                    r = exact.solve_exact(program, hardware_graph, T=T, strict=False,
+                                          time_limit=max(1.0, left() - 0.5),
+                                          hint=(best.placement, ops))
+                    if r["ops"] is not None:
+                        offer(r["placement"], r["ops"], "exact")
+            except _Optimal:
+                raise
+            except Exception as exc:                   # never let the exact stage break a run
+                if verbose:
+                    print(f"    [exact] skipped: {exc}")
+
+        # -- window LNS: exact windows + beam re-route, for large instances --
+        # Opt-in: at a 60 s budget it loses to spending that time on
+        # placement search + polish (A/B on dense_random: 0 wins in 4 seeds).
+        if use_window and use_exact and best is not None and left() > 3:
+            try:
+                from . import exact
+                n2q = sum(1 for op in program if op[0] == "2Q")
+                if exact.available() and n2q > exact_max_gates:
+                    from .window import window_lns
+                    window_lns(program, hardware_graph, best.placement, _to_ir(best.routed),
+                               deadline=t0 + budget, rng=rng, window=window_size,
+                               on_improve=lambda pl, ops: offer(pl, ops, "window"),
+                               verbose=verbose)
+            except _Optimal:
+                raise
+            except Exception as exc:                   # never let the window stage break a run
+                if verbose:
+                    print(f"    [window] skipped: {exc}")
 
         # -- learned value function ------------------------------------------
         if use_net and scored_placements:

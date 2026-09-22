@@ -2,6 +2,12 @@ networkx>=3.5,<4
 matplotlib>=3.10,<4
 numpy>=2.0
 
+# OR-Tools (CP-SAT) powers the exact layered model: the portfolio's last stage
+# on small instances, and the optimality proofs in qroute/certify.py. Optional
+# -- without it the portfolio skips that stage (qaoa_random then scores 12.0
+# instead of 11.5). Wheels exist for Python 3.10-3.14.
+ortools>=9.10
+
 # torch is needed only to train or run the RoutingNet value function; the
 # portfolio runs without it and simply skips that strategy.
 #
