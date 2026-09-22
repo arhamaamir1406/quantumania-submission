@@ -12,7 +12,7 @@ optimal** (`ghz_star`, `chain_trotter`, `ladder_trotter`, `vqe_layers`).
 | `ghz_star` | 7 | 14.0 | **6.5** | 2 | 9 | 6.5 | yes — coupled hub bound |
 | `chain_trotter` | 9 | 15.0 | **4.5** | 0 | 9 | 4.5 | yes — embeds |
 | `ladder_trotter` | 16 | 35.5 | **6.5** | 3 | 7 | 4.0 | yes — `qroute.certify`, 11 s |
-| `qaoa_random` | 18 | 39.0 | 11.5 | 7 | 9 | 5.0 | no ≤ 11.0 up to depth 11 |
+| `qaoa_random` | 18 | 39.0 | 11.5 | 7 | 9 | 5.0 | no ≤ 11.0 up to depth 11; none found at 12–14 |
 | `dense_random` | 40 | 122.0 | 37.0 | 26 | 22 | 10.0 | — |
 | `vqe_layers` | 45 | 58.0 | **3.0** | 0 | 6 | 3.0 | yes — embeds |
 | **total** | 135 | **283.5** | **69.0** | 38 | | 33.0 | |
@@ -328,7 +328,9 @@ transitions; objective `2·swaps + depth`.
   minutes. A windowed variant (`qroute/window.py`: solve 12 gates exactly
   with the mapping fixed, re-route the rest by beam) did improve a 39.5
   solution to 38.5, but at a 60 s budget it loses to spending that time on
-  placement search, so it is opt-in (`use_window=True`).
+  placement search, so it is opt-in (`use_window=True`). Given 10 minutes
+  offline it took a 37.0 solution to 36.5; at a 300 s budget, window on and
+  off both score 37.5 (two seeds), no better than 60 s.
 
 ## Correctness
 
@@ -455,14 +457,13 @@ python -m qroute.train --preset small --distill-from models/value_base.pt --data
 
 ## Still open
 
-- **Certify `ladder_trotter` and `qaoa_random`.** Both return the same score
-  on every seed and budget tried (6.5 and 12.0), which suggests they are at
-  or near the optimum reachable by this search, but the floors (4.0, 5.0) are
-  loose. An exact search would settle it.
-- **`dense_random` needs a different router.** Within the current move set
-  it is exhausted: tail re-routing (~730k re-routes), paths one hop longer
-  than shortest, SABRE-style reverse-traversal seeding, and independent
-  per-core search chains all found nothing beyond what placement search +
-  polish reach. What remains would need a genuinely different move set,
-  e.g. SWAP networks for dense blocks.
+- **`qaoa_random` optimality.** No solution ≤ 11.0 exists with depth ≤ 11
+  (proved); the relaxed model admits depth-12 layouts ≤ 11.0, but none has
+  yet been made emittable (20 min of lazy-ordering search at depth 12, and
+  150 s rounds at 13–14, found none). Closing it needs longer proof runs.
+- **`dense_random` is plateaued at ~37** under every method tried: placement
+  search + polish (60–300 s), whole-instance CP-SAT, window LNS, tail
+  re-routing, longer paths, reverse-traversal seeding, per-core chains. The
+  best ever seen is 36.5 (10-minute offline window LNS). Its analytical floor
+  (10.0) is far too loose to say how much of the gap is real.
 - Stretch goals (decomposition, 1Q optimisation) are not attempted.
