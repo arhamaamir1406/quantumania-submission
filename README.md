@@ -3,25 +3,33 @@
 Placement, routing and scheduling for the Quantum Coalition challenge at
 Q-SITE 2026.
 
-**Current result: 72.0 across the six public benchmarks, down from the
-provided baseline's 283.5 (−74.6%). All six validate.** Earlier versions of
-this solver scored 91.5; placement search (below) is the difference.
+**Current result: 69.5–71.5 across the six public benchmarks (best run
+69.5), down from the provided baseline's 283.5 (−75%). All six validate, and
+three are provably optimal.** Earlier versions of this solver scored 91.5;
+placement search (below) is the difference.
 
 | benchmark | 2Q gates | baseline | ours | swaps | depth | swaps ≥ | floor | gap |
 |---|---|---|---|---|---|---|---|---|
-| `ghz_star` | 7 | 14.0 | 7.0 | 3 | 8 | 2 | 5.5 | 1.5 |
+| `ghz_star` | 7 | 14.0 | **6.5** | 2 | 9 | 2 | 6.5 | **0.0** |
 | `chain_trotter` | 9 | 15.0 | **4.5** | 0 | 9 | 0 | 4.5 | **0.0** |
 | `ladder_trotter` | 16 | 35.5 | 6.5 | 3 | 7 | 1 | 4.0 | 2.5 |
 | `qaoa_random` | 18 | 39.0 | 12.0 | 6 | 12 | 1 | 5.0 | 7.0 |
-| `dense_random` | 40 | 122.0 | 39.0 | 28 | 22 | 4 | 10.0 | 29.0 |
+| `dense_random` | 40 | 122.0 | 37.0 | 26 | 22 | 4 | 10.0 | 27.0 |
 | `vqe_layers` | 45 | 58.0 | **3.0** | 0 | 6 | 0 | 3.0 | **0.0** |
-| **total** | 135 | **283.5** | **72.0** | 40 | | **8** | 32.0 | 40.0 |
+| **total** | 135 | **283.5** | **69.5** | 37 | | **8** | 33.0 | 36.5 |
 
-Measured with the default 10 s budget per benchmark on 24 cores (RTX 5090 for
-the value net). The search is anytime and time-bounded, so totals vary a
-little between runs and machines — 70.5–75.5 across the runs we made, almost
-all of it on `dense_random` (38–43). On a single core it scores ~75.5; with a
-60 s budget, ~70.5.
+Measured with the default 60 s budget per benchmark on 24 cores. The search
+is anytime and time-bounded: five of the six instances return the same score
+on every run, and `dense_random` varies between 37.0 and 39.0 (so the total
+between 69.5 and 71.5). Instances that reach their provable floor return
+immediately, so a full run takes ~2.5–3 minutes. Budget sweep (same code):
+
+| budget | 10 s | 30 s | 60 s |
+|---|---|---|---|
+| total | 72.0–72.5 | 71.0 | 69.5–71.5 |
+
+The rules set no time limit on `solve()`; the budget is a parameter
+(`solve(program, hw, budget=...)`). On a single core at 10 s it scores ~75.5.
 
 `floor` is a provable lower bound, computed by `qroute/bounds.py` — see
 *Lower bounds* below. `chain_trotter` and `vqe_layers` sit exactly on it, so
@@ -70,12 +78,15 @@ Every strategy runs, self-scores, and the best valid candidate wins:
 1. **Zero-SWAP embedding** — VF2 subgraph monomorphism of the interaction
    graph into the hardware graph. Two O(1) rejections first (more edges, or
    higher max degree, than the hardware) so dense programs fail instantly.
-   This alone solves `chain_trotter` and `vqe_layers` optimally, and the
-   portfolio returns immediately once a candidate sits on the provable floor.
+   This alone solves `chain_trotter` and `vqe_layers` optimally. Any stage
+   that produces a candidate on the provable floor ends the solve at once.
 2. **Placement search** (`qroute/placement_search.py`) — the main source of
    score; see below.
-3. **Wide beam search** (width 1200) over move sets from the best placements
-   found, with a `(gate, mapping)` transposition table.
+3. **Polish** — the 12 best distinct placements are re-routed under 216
+   beam settings (width × paths per gate × heuristic weight). The beam is
+   non-monotone in all three, so a different setting often routes the same
+   placement more cheaply; this replaced a single width-1200 beam that never
+   beat the placement search.
 4. **Learned value function** (`RoutingNet`) driving both beam search and a
    greedy rollout, when a checkpoint is present — see below.
 5. **The provided baseline**, kept as a safety net — so the result can never
@@ -262,6 +273,14 @@ the program makes interact:
   `swaps >= ceil((|E_int| - min(|E_int|, |E_hw|)) / (2(D-1)))`.
 - **Embeddability.** If the interaction graph is not subgraph-monomorphic to
   the hardware graph, at least one SWAP is required.
+- **Coupled hub bound.** For a logical `v` with `g(v)` gates and `d(v)`
+  partners, let `c` be the SWAPs that move `v`. Everything touching `v` is
+  serialised, so `depth >= g(v) + c`; the `c` moves add at most `(D-1)c`
+  partners and every other SWAP at most one. Minimising
+  `swaps + 0.5*depth` over `c` couples the two terms, which the bounds above
+  never do. On `ghz_star` (hub with 7 partners and 7 gates) it gives
+  `min over c of 3.5 + 1.5c + max(0, 4 - 2c)` = **6.5** at `c = 2` — exactly
+  our result, so `ghz_star` is provably optimal.
 - **Depth.** Physical depth is at least the logical program's ASAP depth.
 
 Run `python -m qroute.bounds` for the table.
@@ -284,8 +303,8 @@ achievable on `chain_trotter` and `vqe_layers`, where the interaction graph
 embeds — and we already achieve it on both, optimally. So a reported "0 SWAPs"
 can only refer to those instances, not to the set.
 
-Where the headroom actually is: 40 of our 72.0 is SWAP count, and 29 of the
-40.0 gap is `dense_random` alone. The floors are loose there, so not all of
+Where the headroom actually is: 37 of our 69.5 is SWAP count, and 27 of the
+36.5 gap is `dense_random` alone. The floors are loose there, so not all of
 that gap is achievable.
 
 ## Correctness
@@ -410,15 +429,14 @@ python -m qroute.train --preset small --distill-from models/value_base.pt --data
 
 ## Still open
 
-- **Budget.** The rules set no time limit on `solve()`; the 10 s default is
-  our own. 60 s measured ~70.5 vs ~72–73 at 10 s, and reduces run-to-run
-  variance (`ghz_star` reaches 6.5 in some runs, 7.0 in others).
-- **Certify the small instances.** An exact search on `ghz_star` and
-  `ladder_trotter` would either find the last half-points or prove the
-  current results optimal, as `chain_trotter` and `vqe_layers` already are.
+- **Certify `ladder_trotter` and `qaoa_random`.** Both return the same score
+  on every seed and budget tried (6.5 and 12.0), which suggests they are at
+  or near the optimum reachable by this search, but the floors (4.0, 5.0) are
+  loose. An exact search would settle it.
 - **`dense_random` needs a different router.** Within the current move set
-  it is exhausted: tail re-routing, longer paths, and SABRE-style
-  reverse-traversal seeding all found nothing. What remains would need a
-  genuinely different move set, e.g. SWAP networks for dense blocks.
-- Commutation bubbling and peephole SWAP deletion as post-passes.
+  it is exhausted: tail re-routing (~730k re-routes), paths one hop longer
+  than shortest, SABRE-style reverse-traversal seeding, and independent
+  per-core search chains all found nothing beyond what placement search +
+  polish reach. What remains would need a genuinely different move set,
+  e.g. SWAP networks for dense blocks.
 - Stretch goals (decomposition, 1Q optimisation) are not attempted.

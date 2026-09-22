@@ -229,3 +229,27 @@ def search_placements(program, hw, deadline: float, rng: random.Random,
         return sorted(found + scored, key=lambda x: x[0])
     finally:
         ev.close()
+
+
+# -- polish ----------------------------------------------------------------
+
+
+def polish(problem: Problem, placements: list[dict[int, int]], deadline: float,
+           incumbent: float = INF, on_improve=None):
+    """Re-route the best placements under many beam settings; the beam is
+    non-monotone in width and weight, so a different setting often finds a
+    cheaper routing from the same start."""
+    best = incumbent
+    settings = [(w, mp_, wt) for w in (4, 8, 12, 24, 32, 64, 128, 256)
+                for mp_ in (6, 12, 24) for wt in (0.4, 0.6, 1.0)]
+    for w, mp_, wt in settings:            # breadth first across placements
+        for pl in placements:
+            if time.monotonic() > deadline:
+                return best
+            s = beam_search(problem, problem.initial(pl), width=w, max_paths=mp_, weight=wt,
+                            incumbent=best, deadline=deadline)
+            if s is not None and s.cost < best:
+                best = s.cost
+                if on_improve is not None:
+                    on_improve(pl, s.ops())
+    return best

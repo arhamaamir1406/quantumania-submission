@@ -23,7 +23,7 @@ from .bounds import score_lower_bound
 from .ir import evaluate
 from .mdp import Problem
 from .placement import embed_placement, identity_placement
-from .placement_search import search_placements
+from .placement_search import polish, search_placements
 from .search import beam_search, greedy_rollout
 
 INF = float("inf")
@@ -33,6 +33,10 @@ INF = float("inf")
 # beam does not fit in a 10-second budget without a GPU.
 CHECKPOINTS_GPU = ("models/value_large.pt", "models/value_base.pt", "models/value_small.pt")
 CHECKPOINTS_CPU = ("models/value_small.pt", "models/value_tiny.pt", "models/value_base.pt")
+
+
+class _Optimal(Exception):
+    """Raised by offer() when a candidate reaches the provable floor."""
 
 
 class Candidate:
@@ -80,13 +84,14 @@ def solve(program: list[tuple], hardware_graph: nx.Graph, budget: float = 10.0,
           seeds: int = 48, beam_width: int = 1200, verbose: bool = False,
           net=None, net_device: str | None = None, net_quantile: int | None = None,
           net_beam: int | None = None, net_paths: tuple[str, ...] | None = None,
-          use_net: bool = True, placement_share: float = 0.75,
-          workers: int | None = None):
+          use_net: bool = True, placement_share: float = 0.65,
+          polish_share: float = 0.9, workers: int | None = None, seed: int = 0xC0FFEE):
     """Returns (initial_placement, routed_program)."""
     t0 = time.monotonic()
-    rng = random.Random(0xC0FFEE)
+    rng = random.Random(seed)
     problem = Problem(program, hardware_graph)
     best: Candidate | None = None
+    floor = score_lower_bound(program, hardware_graph)[0]
 
     def left():
         return budget - (time.monotonic() - t0)
@@ -102,6 +107,8 @@ def solve(program: list[tuple], hardware_graph: nx.Graph, budget: float = 10.0,
             best = Candidate(score, dict(placement), routed, tag)
             if verbose:
                 print(f"    [{tag}] {score:.1f}  <- best")
+            if score <= floor:
+                raise _Optimal
         elif verbose:
             print(f"    [{tag}] {score:.1f}")
 
@@ -114,72 +121,79 @@ def solve(program: list[tuple], hardware_graph: nx.Graph, budget: float = 10.0,
         if verbose:
             print(f"    [baseline] {best.score:.1f}")
 
-    # -- zero-SWAP embedding ---------------------------------------------
-    emb = embed_placement(program, hardware_graph)
-    if emb is not None:
-        s = problem.initial(emb)
-        if problem.is_terminal(s):
-            offer(emb, s.ops(), "embed")
+    # A candidate on the provable floor cannot be beaten: offer() raises
+    # _Optimal and the remaining stages are skipped.
+    try:
+        # -- zero-SWAP embedding ---------------------------------------------
+        emb = embed_placement(program, hardware_graph)
+        if emb is not None:
+            s = problem.initial(emb)
+            if problem.is_terminal(s):
+                offer(emb, s.ops(), "embed")
 
-    # A candidate on the provable floor cannot be beaten; stop spending budget.
-    floor = score_lower_bound(program, hardware_graph)[0]
-    if best is not None and best.score <= floor:
-        return best.placement, best.routed
+        # -- placement search: sample widely, then local-search the best -------
+        # The starting placement is the main lever on the score; routing from a
+        # fixed placement saturates. See placement_search.py.
+        extra = [("identity", identity_placement(program, hardware_graph))]
+        if emb is not None:
+            extra.append(("embed-seed", emb))
+        scored_placements = search_placements(
+            program, hardware_graph, deadline=t0 + budget * placement_share, rng=rng,
+            offer=offer, extra=extra, workers=workers)
 
-    # -- placement search: sample widely, then local-search the best -------
-    # The starting placement is the main lever on the score; routing from a
-    # fixed placement saturates. See placement_search.py.
-    extra = [("identity", identity_placement(program, hardware_graph))]
-    if emb is not None:
-        extra.append(("embed-seed", emb))
-    scored_placements = search_placements(
-        program, hardware_graph, deadline=t0 + budget * placement_share, rng=rng,
-        offer=offer, extra=extra, workers=workers)
+        # -- polish: re-route the best placements under many beam settings -----
+        # The beam is non-monotone in width and weight, so a different setting
+        # often routes the same placement more cheaply. This replaced a single
+        # width-1200 beam, which never beat the placement search's own result.
+        scored_placements.sort(key=lambda x: x[0])
+        top, keys = [], set()
+        for _, tag, pl in scored_placements:
+            k = tuple(sorted(pl.items()))
+            if k not in keys:
+                keys.add(k)
+                top.append((tag, pl))
+            if len(top) >= 12:
+                break
+        tags = {tuple(sorted(pl.items())): tag for tag, pl in top}
+        polish(problem, [pl for _, pl in top], deadline=t0 + budget * polish_share,
+               incumbent=best.score if best else INF,
+               on_improve=lambda pl, ops: offer(pl, ops, f"polish/{tags[tuple(sorted(pl.items()))]}"))
 
-    # -- beam search from the most promising placements -------------------
-    scored_placements.sort(key=lambda x: x[0])
-    for _, tag, pl in scored_placements[:3]:
-        if time.monotonic() - t0 > budget:
-            break
-        s = beam_search(problem, problem.initial(pl), width=beam_width,
-                        incumbent=best.score if best else INF, deadline=t0 + budget)
-        if s is not None:
-            offer(pl, s.ops(), f"beam/{tag}")
-        if time.monotonic() - t0 > budget:
-            break
+        # -- learned value function ------------------------------------------
+        if use_net and scored_placements:
+            device = _pick_device(net_device)
+            if net is None:
+                net = load_value_net(device, net_paths)
+            if net is not None:
+                try:
+                    from .gnn import make_value_fn
+                    vf = make_value_fn(net, problem, device=device, quantile=net_quantile,
+                                       max_batch=1024 if device.startswith("cuda") else 256)
+                    # An 18M-parameter net is ~3ms/state on CPU and ~30us on a GPU,
+                    # so the affordable beam width differs by two orders of magnitude.
+                    width = net_beam if net_beam is not None else (
+                        beam_width if device.startswith("cuda") else max(16, beam_width // 24))
+                    for _, tag, pl in scored_placements[:2]:
+                        if left() <= 0:
+                            break
+                        s = beam_search(problem, problem.initial(pl), width=width,
+                                        incumbent=best.score if best else INF, value_fn=vf,
+                                        deadline=t0 + budget)
+                        if s is not None:
+                            offer(pl, s.ops(), f"net-beam/{tag}")
+                    # A greedy rollout under the net is cheap and sometimes escapes
+                    # a beam that the incumbent pruned too aggressively.
+                    if left() > 0 and scored_placements:
+                        _, tag, pl = scored_placements[0]
+                        s = greedy_rollout(problem, problem.initial(pl), value_fn=vf)
+                        if s is not None:
+                            offer(pl, s.ops(), f"net-greedy/{tag}")
+                except Exception as exc:                       # never let the net break a run
+                    if verbose:
+                        print(f"    [net] skipped: {exc}")
 
-    # -- learned value function ------------------------------------------
-    if use_net and scored_placements:
-        device = _pick_device(net_device)
-        if net is None:
-            net = load_value_net(device, net_paths)
-        if net is not None:
-            try:
-                from .gnn import make_value_fn
-                vf = make_value_fn(net, problem, device=device, quantile=net_quantile,
-                                   max_batch=1024 if device.startswith("cuda") else 256)
-                # An 18M-parameter net is ~3ms/state on CPU and ~30us on a GPU,
-                # so the affordable beam width differs by two orders of magnitude.
-                width = net_beam if net_beam is not None else (
-                    beam_width if device.startswith("cuda") else max(16, beam_width // 24))
-                for _, tag, pl in scored_placements[:2]:
-                    if left() <= 0:
-                        break
-                    s = beam_search(problem, problem.initial(pl), width=width,
-                                    incumbent=best.score if best else INF, value_fn=vf,
-                                    deadline=t0 + budget)
-                    if s is not None:
-                        offer(pl, s.ops(), f"net-beam/{tag}")
-                # A greedy rollout under the net is cheap and sometimes escapes
-                # a beam that the incumbent pruned too aggressively.
-                if left() > 0 and scored_placements:
-                    _, tag, pl = scored_placements[0]
-                    s = greedy_rollout(problem, problem.initial(pl), value_fn=vf)
-                    if s is not None:
-                        offer(pl, s.ops(), f"net-greedy/{tag}")
-            except Exception as exc:                       # never let the net break a run
-                if verbose:
-                    print(f"    [net] skipped: {exc}")
+    except _Optimal:
+        pass
 
     assert best is not None, "portfolio produced no valid candidate"
     return best.placement, best.routed

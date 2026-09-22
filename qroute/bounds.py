@@ -39,9 +39,28 @@ Physical depth is at least the logical program's ASAP depth: the scheduler may
 only add layers, never remove them, and inserted SWAPs cannot make two gates
 sharing a qubit commute into one layer.
 
-The bounds are combined as `max(degree, edge, embed) + 0.5 * asap_depth`. They
-are individually weak -- they do not interact, and none of them knows about
-depth -- so the true optimum is generally well above them.
+Coupled hub bound
+-----------------
+The bounds above treat SWAPs and depth separately. For a logical qubit `v`
+with `g(v)` gates and `d(v)` distinct partners, let `c` be the number of SWAPs
+that move `v`. Every op touching `v` -- its gates and the SWAPs that move it
+-- shares the physical qubit `v` occupies at that moment with the previous
+such op, so they are serialised: `depth >= g(v) + c`. By the degree argument,
+the `c` moving SWAPs add at most `(D - 1) c` new neighbours and every other
+SWAP at most one, so at least `max(0, d(v) - D - (D - 1) c)` other SWAPs are
+needed. Any solution has *some* `c`, so
+
+    score >= min over c >= 0 of
+             max(c + max(0, d(v) - D - (D-1) c), S_other)
+             + 0.5 * max(g(v) + c, asap_depth)
+
+where `S_other` is the edge-count/embeddability bound. Moving a hub is
+cheaper per new partner (1.5 per `D - 1`) than bringing partners to it (1
+each), but only up to the point where the extra depth outweighs it. This
+bound proves `ghz_star` optimal at 6.5.
+
+The final floor is the maximum of the coupled bound and
+`max(degree, edge, embed) + 0.5 * asap_depth`.
 """
 from __future__ import annotations
 
@@ -97,11 +116,48 @@ def swap_lower_bound(program: list[tuple], hw: nx.Graph) -> tuple[int, str]:
     return best, why
 
 
+def hub_bound(program: list[tuple], hw: nx.Graph, s_other: int, depth: int) -> tuple[float, str]:
+    """The coupled SWAP/depth bound (see module docstring)."""
+    inter = interaction_graph(program)
+    D = max(dict(hw.degree()).values())
+    gates = {}
+    for op in program:
+        if op[0] == "2Q":
+            for q in op[1:]:
+                gates[q] = gates.get(q, 0) + 1
+    best, why = 0.0, ""
+    for v, d in inter.degree():
+        if d <= D:
+            continue
+        f = min(max(c + max(0, d - D - (D - 1) * c), s_other) + 0.5 * max(gates[v] + c, depth)
+                for c in range(0, d + 1))
+        if f > best:
+            best, why = f, f"hub q{v}: {d} partners, {gates[v]} gates, moves trade SWAPs for depth"
+    return best, why
+
+
+def edge_embed_bound(program: list[tuple], hw: nx.Graph) -> int:
+    """The SWAP floor from edge count and embeddability alone (no degree term)."""
+    inter = interaction_graph(program)
+    D = max(dict(hw.degree()).values())
+    ei, eh = inter.number_of_edges(), hw.number_of_edges()
+    if ei > eh:
+        return math.ceil((ei - eh) / (2 * (D - 1)))
+    if ei and inter.number_of_nodes() <= hw.number_of_nodes():
+        if not isomorphism.GraphMatcher(hw, inter).subgraph_is_monomorphic():
+            return 1
+    return 0
+
+
 def score_lower_bound(program: list[tuple], hw: nx.Graph) -> tuple[float, int, int, str]:
     """-> (floor, swap_floor, depth_floor, reason)."""
     s, why = swap_lower_bound(program, hw)
     d = asap_depth(program)
-    return s + 0.5 * d, s, d, why
+    floor = s + 0.5 * d
+    hb, hwhy = hub_bound(program, hw, edge_embed_bound(program, hw), d)
+    if hb > floor:
+        floor, why = hb, hwhy
+    return floor, s, d, why
 
 
 def report(hw: nx.Graph | None = None) -> None:

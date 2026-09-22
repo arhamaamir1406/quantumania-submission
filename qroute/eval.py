@@ -15,7 +15,7 @@ from .portfolio import solve
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--budget", type=float, default=10.0)
+    ap.add_argument("--budget", type=float, default=60.0)
     ap.add_argument("--beam", type=int, default=1200)
     ap.add_argument("--seeds", type=int, default=48)
     ap.add_argument("--only", default=None)

@@ -13,7 +13,7 @@ import networkx as nx
 
 from qroute.portfolio import solve as _portfolio_solve
 
-DEFAULT_BUDGET = 10.0
+DEFAULT_BUDGET = 60.0
 
 
 def solve(program: list[tuple], hardware_graph: nx.Graph, budget: float = DEFAULT_BUDGET):
