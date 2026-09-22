@@ -3,18 +3,25 @@
 Placement, routing and scheduling for the Quantum Coalition challenge at
 Q-SITE 2026.
 
-**Current result: 91.5 across the six public benchmarks, down from the
-provided baseline's 283.5 (−67.7%). All six validate.**
+**Current result: 72.0 across the six public benchmarks, down from the
+provided baseline's 283.5 (−74.6%). All six validate.** Earlier versions of
+this solver scored 91.5; placement search (below) is the difference.
 
 | benchmark | 2Q gates | baseline | ours | swaps | depth | swaps ≥ | floor | gap |
 |---|---|---|---|---|---|---|---|---|
-| `ghz_star` | 7 | 14.0 | 7.5 | 4 | 7 | 2 | 5.5 | 2.0 |
+| `ghz_star` | 7 | 14.0 | 7.0 | 3 | 8 | 2 | 5.5 | 1.5 |
 | `chain_trotter` | 9 | 15.0 | **4.5** | 0 | 9 | 0 | 4.5 | **0.0** |
-| `ladder_trotter` | 16 | 35.5 | 11.0 | 6 | 10 | 1 | 4.0 | 7.0 |
-| `qaoa_random` | 18 | 39.0 | 18.5 | 12 | 13 | 1 | 5.0 | 13.5 |
-| `dense_random` | 40 | 122.0 | 47.0 | 34 | 26 | 4 | 10.0 | 37.0 |
+| `ladder_trotter` | 16 | 35.5 | 6.5 | 3 | 7 | 1 | 4.0 | 2.5 |
+| `qaoa_random` | 18 | 39.0 | 12.0 | 6 | 12 | 1 | 5.0 | 7.0 |
+| `dense_random` | 40 | 122.0 | 39.0 | 28 | 22 | 4 | 10.0 | 29.0 |
 | `vqe_layers` | 45 | 58.0 | **3.0** | 0 | 6 | 0 | 3.0 | **0.0** |
-| **total** | 135 | **283.5** | **91.5** | 56 | | **8** | 32.0 | 59.5 |
+| **total** | 135 | **283.5** | **72.0** | 40 | | **8** | 32.0 | 40.0 |
+
+Measured with the default 10 s budget per benchmark on 24 cores (RTX 5090 for
+the value net). The search is anytime and time-bounded, so totals vary a
+little between runs and machines — 70.5–75.5 across the runs we made, almost
+all of it on `dense_random` (38–43). On a single core it scores ~75.5; with a
+60 s budget, ~70.5.
 
 `floor` is a provable lower bound, computed by `qroute/bounds.py` — see
 *Lower bounds* below. `chain_trotter` and `vqe_layers` sit exactly on it, so
@@ -63,18 +70,44 @@ Every strategy runs, self-scores, and the best valid candidate wins:
 1. **Zero-SWAP embedding** — VF2 subgraph monomorphism of the interaction
    graph into the hardware graph. Two O(1) rejections first (more edges, or
    higher max degree, than the hardware) so dense programs fail instantly.
-   This alone solves `chain_trotter` and `vqe_layers` optimally.
-2. **Constructive placement** — grow outward from the busiest logical qubit,
-   placing each next qubit where it minimises weighted distance to its
-   already-placed neighbours.
-3. **Greedy rollouts** from a spread of placements (constructive, jittered
-   constructive, random), with noise for diversity.
-4. **Beam search** over move sets from the most promising placements, with a
-   `(gate, mapping)` transposition table.
-5. **Learned value function** (`RoutingNet`) driving both beam search and a
+   This alone solves `chain_trotter` and `vqe_layers` optimally, and the
+   portfolio returns immediately once a candidate sits on the provable floor.
+2. **Placement search** (`qroute/placement_search.py`) — the main source of
+   score; see below.
+3. **Wide beam search** (width 1200) over move sets from the best placements
+   found, with a `(gate, mapping)` transposition table.
+4. **Learned value function** (`RoutingNet`) driving both beam search and a
    greedy rollout, when a checkpoint is present — see below.
-6. **The provided baseline**, kept as a safety net — so the result can never
+5. **The provided baseline**, kept as a safety net — so the result can never
    be worse than it, and never invalid.
+
+### Placement search
+
+Routing from a *fixed* placement saturates quickly. Beam widths from 50 to
+1200 return the same score; re-routing the tail of the best solution from
+random cut points with randomised beam settings (~730k re-routes) found no
+improvement on any benchmark; allowing paths one hop longer than shortest
+found none either. The starting placement is what moves the score, and good
+placements are rare — only 2–15% of jittered constructive placements beat
+the old portfolio's result.
+
+So the solver spends most of its budget searching placements, using a narrow
+width-16 beam (1–60 ms) as the fitness function:
+
+1. **Sampling** — a few hundred constructive placements at a spread of jitter
+   levels, each scored by the narrow beam. Purely random placements were
+   tried and are far worse (e.g. 23.5 vs 13.0 on `qaoa_random`).
+2. **Iterated local search** from the three best distinct placements. The
+   neighbourhood swaps two logicals, or moves one to a free physical qubit,
+   within 2 hops of where it sits (~9 moves per logical on this degree-3
+   graph). First-improvement over shuffled batches sized to the worker
+   count; on a local optimum, perturb the incumbent with 2–3 random swaps.
+
+Beam width is non-monotone in quality here: at a fixed time budget, more
+placements at width 16 beat fewer at widths (16, 48) on every worker count
+tried. Evaluation runs in a fork-based process pool, falling back to serial
+where fork is unavailable or only one core exists; `beam_search` takes a
+deadline so the later stages stay inside the budget.
 
 ### Learned value function
 
@@ -187,12 +220,22 @@ clipping, EMA weights, the dataset resident on-device in fp16. Collection runs
 across processes (`--workers`). `--distill-from` trains a small student on a
 large teacher, which is how a CPU-affordable checkpoint is produced.
 
-> **Status: implemented and smoke-tested end to end, not yet trained.** All
-> three paths (fresh, DAgger, distillation) run; no checkpoint is shipped yet.
-> Until one exists under `models/`, the portfolio skips this strategy — and
-> with an untrained checkpoint present the benchmark total is unchanged at
-> 91.5, because a portfolio member only wins an instance if it self-scores
-> better. A regression in the net can cost search time; it can never cost score.
+> **Status: trained, and it does not move the score.** Two independent
+> end-to-end runs (300,529 states each; `base` 18M and a distilled `small`
+> 2.2M, both shipped under `models/`) left the old portfolio's total at
+> exactly 91.5, and with placement search the net wins no instance outright.
+> Best validation regret was 0.2505 (`base`) and 0.2514 (`small`), reached
+> around epoch 15; after that validation regret climbs to ~0.30 while
+> training loss keeps falling, i.e. it overfits labels it cannot beat.
+>
+> The reason is structural, not architectural. With the move-set search
+> space, a value function only orders candidates, and on three of the four
+> routed benchmarks a *random* value function reaches the same score as the
+> trained net (on `dense_random`: zero 62.0, random 63.0, hand heuristic
+> 53.0, net 50.0 from the same placements). The 2.2M and 18M nets score
+> identically. Labels are the teacher beam's own cost-to-go, which caps what
+> the net can learn. A larger net, an ensemble, or a different architecture
+> (GAT etc.) would not change this; the placement is the lever.
 
 ### Inference cost
 
@@ -241,8 +284,9 @@ achievable on `chain_trotter` and `vqe_layers`, where the interaction graph
 embeds — and we already achieve it on both, optimally. So a reported "0 SWAPs"
 can only refer to those instances, not to the set.
 
-Where the headroom actually is: 56 of our 91.5 is SWAP count, and 37 of the
-59.5 gap is `dense_random` alone.
+Where the headroom actually is: 40 of our 72.0 is SWAP count, and 29 of the
+40.0 gap is `dense_random` alone. The floors are loose there, so not all of
+that gap is achievable.
 
 ## Correctness
 
@@ -272,6 +316,7 @@ qroute/
   mdp.py                 depth-aware routing MDP
   search.py              move-set branching, rollouts, beam search
   placement.py           VF2 embedding, constructive, random
+  placement_search.py    sampled placements + iterated local search
   portfolio.py           run-everything-take-the-min solver
   gnn.py                 RoutingNet: multi-stream graph transformer value fn
   features.py            state -> node / edge / gate-token tensors
@@ -365,18 +410,15 @@ python -m qroute.train --preset small --distill-from models/value_base.pt --data
 
 ## Still open
 
-- Train the value net and measure it against the hand heuristic. The code is
-  written and smoke-tested end to end; nothing has been fitted yet.
-- Placement is the lever on SWAP count, and SWAP count is 56 of our 91.5. The
-  zero-SWAP check is currently all-or-nothing (VF2 monomorphism); a
-  *maximum-coverage* placement — maximise the weighted interaction edges that
-  are adjacent at time zero — should help every instance that fails to embed.
-- Large neighbourhood search — rip out a 4–6 gate window, re-route it
-  exhaustively, repeat. This is the main remaining lever on `dense_random`,
-  which is 47 of our 91.5.
-- Commutation bubbling as a post-pass: a SWAP and an adjacent GATE sharing no
-  physical qubit can be transposed freely, moving SWAPs into idle layers.
-- Peephole SWAP deletion.
-- `ghz_star` currently scores 7.5 under move-set branching but reached 7.0
-  under an earlier single-SWAP beam; both should be portfolio members.
-- Exhaustive/A\* search on the small benchmarks to certify optimality.
+- **Budget.** The rules set no time limit on `solve()`; the 10 s default is
+  our own. 60 s measured ~70.5 vs ~72–73 at 10 s, and reduces run-to-run
+  variance (`ghz_star` reaches 6.5 in some runs, 7.0 in others).
+- **Certify the small instances.** An exact search on `ghz_star` and
+  `ladder_trotter` would either find the last half-points or prove the
+  current results optimal, as `chain_trotter` and `vqe_layers` already are.
+- **`dense_random` needs a different router.** Within the current move set
+  it is exhausted: tail re-routing, longer paths, and SABRE-style
+  reverse-traversal seeding all found nothing. What remains would need a
+  genuinely different move set, e.g. SWAP networks for dense blocks.
+- Commutation bubbling and peephole SWAP deletion as post-passes.
+- Stretch goals (decomposition, 1Q optimisation) are not attempted.
