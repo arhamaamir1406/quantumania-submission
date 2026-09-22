@@ -15,6 +15,7 @@ lookahead heuristic or the learned GraphSAGE value function.
 from __future__ import annotations
 
 import random
+import time
 from collections.abc import Callable
 
 import networkx as nx
@@ -77,10 +78,12 @@ def greedy_rollout(problem: Problem, s: State, rng: random.Random | None = None,
 
 def beam_search(problem: Problem, s0: State, width: int = 1500, window: int = 12,
                 weight: float = 0.6, max_paths: int = 12, incumbent: float = INF,
-                value_fn: ValueFn | None = None) -> State | None:
+                value_fn: ValueFn | None = None, deadline: float | None = None) -> State | None:
     """Beam search over move sets, with a (gate, mapping) transposition table.
 
-    One round per program gate, so search depth is bounded and known.
+    One round per program gate, so search depth is bounded and known. With a
+    `deadline` (time.monotonic()), gives up when it passes and returns None --
+    a partial beam holds no complete solution worth returning.
     """
     if problem.is_terminal(s0):
         return s0
@@ -90,6 +93,8 @@ def beam_search(problem: Problem, s0: State, width: int = 1500, window: int = 12
     best_cost = incumbent
 
     while beam:
+        if deadline is not None and time.monotonic() > deadline:
+            return None
         pending: list[State] = []
         keys: set[tuple] = set()
         for s in beam:
