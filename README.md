@@ -3,9 +3,12 @@
 Placement, routing and scheduling for the Quantum Coalition challenge at
 Q-SITE 2026.
 
-**Current result: 69.0 across the six public benchmarks, down from the
-provided baseline's 283.5 (−75.7%). All six validate, and four are provably
+**Best verified result: 68.0 across the six public benchmarks, down from the
+provided baseline's 283.5 (−76.0%). All six validate, and four are provably
 optimal** (`ghz_star`, `chain_trotter`, `ladder_trotter`, `vqe_layers`).
+The 60 s portfolio alone gives 69.0; `dense_random`'s 36.0 comes from tube
+LNS (see *Tube LNS* below) and is stored in `results/`, checkable with
+`python -m qroute.verify results/dense_random.json`.
 
 | benchmark | 2Q gates | baseline | ours | swaps | depth | floor | proven optimal |
 |---|---|---|---|---|---|---|---|
@@ -13,13 +16,14 @@ optimal** (`ghz_star`, `chain_trotter`, `ladder_trotter`, `vqe_layers`).
 | `chain_trotter` | 9 | 15.0 | **4.5** | 0 | 9 | 4.5 | yes — embeds |
 | `ladder_trotter` | 16 | 35.5 | **6.5** | 3 | 7 | 4.0 | yes — `qroute.certify`, 11 s |
 | `qaoa_random` | 18 | 39.0 | 11.5 | 7 | 9 | 5.0 | no ≤ 11.0 up to depth 11; none found at 12–14 |
-| `dense_random` | 40 | 122.0 | 37.0 | 26 | 22 | 10.0 | — |
+| `dense_random` | 40 | 122.0 | **36.0**¹ | 24 | 24 | 10.0 | — |
 | `vqe_layers` | 45 | 58.0 | **3.0** | 0 | 6 | 3.0 | yes — embeds |
-| **total** | 135 | **283.5** | **69.0** | 38 | | 33.0 | |
+| **total** | 135 | **283.5** | **68.0** | 36 | | 33.0 | |
 
-Measured with the default 60 s budget per benchmark on 24 cores.
-`dense_random` varies between runs (37.0–39.0); the other five return the
-same score every run. `floor` is the analytical bound from `qroute/bounds.py`;
+Measured with the default 60 s budget per benchmark on 24 cores, except
+¹: portfolio + four tube-LNS rounds, ~11 minutes on 16 cores (the 60 s
+portfolio alone gives 37.0–39.0 there). The other five return the same score
+every run. `floor` is the analytical bound from `qroute/bounds.py`;
 the last column adds the computational proofs from `qroute/certify.py`.
 
 `floor` is a provable lower bound, computed by `qroute/bounds.py` — see
@@ -155,8 +159,10 @@ width-16 beam (1–60 ms) as the fitness function:
 
 Beam width is non-monotone in quality here: at a fixed time budget, more
 placements at width 16 beat fewer at widths (16, 48) on every worker count
-tried. Evaluation runs in a fork-based process pool, falling back to serial
-where fork is unavailable or only one core exists; `beam_search` takes a
+tried. Evaluation runs in a process pool -- fork on Linux, spawn on Windows
+(which has no fork; before this the whole search ran on one core there, and
+`dense_random` at 60 s averaged 39.8 over three seeds vs 39.0 with the pool
+on 16 cores) -- falling back to serial on one core or very short budgets; `beam_search` takes a
 deadline so the later stages stay inside the budget.
 
 ### Learned value function
@@ -412,6 +418,54 @@ transitions; objective `2·swaps + depth`.
   offline it took a 37.0 solution to 36.5; at a 300 s budget, window on and
   off both score 37.5 (two seeds), no better than 60 s.
 
+## Watermark model and tube LNS
+
+`qroute/watermark.py` is a second exact model, built for two things the lazy
+model above cannot do: be exact about the order rule in a *single* solve, and
+scale to `dense_random` through a restricted neighbourhood.
+
+**Exact order rule in one solve.** Instead of solving the relaxation and
+adding cuts, every physical qubit carries an integer watermark `H[p][t]` —
+the largest program index of any gate with a dependency chain into `(p, t)`.
+It only grows, flows across SWAPs, and gate `k` sets it to `k`; gate `k` may
+run on `(p, q)` only while both watermarks are below `k`. That is exactly the
+"no chain from a later gate back to an earlier one" condition, so *every*
+solution can be emitted in program order and *every* valid routed program is
+a solution: the model is exact, not a relaxation or a restriction. Gates are
+also confined to their logical ASAP/ALAP layer window, and three dominance
+cuts (no repeated SWAP, no SWAP of two empty qubits, no SWAP with nothing
+after it on either qubit) prune solutions that have a strictly-no-worse twin.
+It reproduces the known optima (`ghz_star` 6.5 proved optimal in ~30 s;
+`ladder_trotter` 6.5) and passes the organisers' scorer on every solution.
+
+**Tube LNS** (`qroute/tube.py`). Whole-instance CP-SAT does not improve
+`dense_random` in 15 minutes, and windows pinned to the incumbent at both
+ends turned out to be locally optimal already (every window we solved came
+back OPTIMAL at the incumbent's own cost). The tube keeps the whole instance
+but lets each gate move only within `r` layers of where the incumbent runs
+it; SWAPs stay completely free. Because the neighbourhood spans the entire
+horizon, CP-SAT can trade SWAPs for depth globally — the kind of move that
+took `qaoa_random` from 12.0 to 11.5 — and the model stays small enough to
+solve. On `dense_random`:
+
+| run | start | tube rounds | result |
+|---|---|---|---|
+| 1 | 38.0 (portfolio) | r=2 | **36.5** (25 SWAPs, depth 23) in 4 min |
+| 2 | 40.0 (portfolio, seed 11) | r=2, 3, 2, 4 | 39.0 → 38.5 → **36.0** (24 SWAPs, depth 24) |
+| 3 | 38.5, 39.0 (seeds 12, 13) | r=2, 3 | 38.5, 38.5 — no gain |
+| 4 | 36.0 | r=5, 6, 4 (300 s each) | no gain — a local optimum |
+
+It is **not reliable yet**: from a given start it either finds a large step
+or nothing, and a 900 s `solve_long` run (portfolio restarts + tube) ended at
+39.5. So it is opt-in — `submission.solve(program, hw, budget=900)` uses it
+for programs over 24 gates — and the 60 s default is unchanged.
+
+Two things did not pay off and are not shipped: exact per-segment SWAP
+bounds (the layered model proves them too weakly — bound 1 against a true
+2–3 on 14-gate `dense_random` segments), and depth-sliced proofs of
+`qaoa_random` (depths 19–20 are infeasible at ≤ 11.0 in seconds, but depths
+12–18 stay UNKNOWN after 5–25 minutes each).
+
 ## Correctness
 
 The scorer strips inserted SWAPs and requires the remainder to equal the
@@ -450,12 +504,17 @@ qroute/
   exact.py               CP-SAT layered model: solver + relaxation
   certify.py             optimality proofs by depth-sliced relaxation
   window.py              window LNS (exact windows + beam), opt-in
+  watermark.py           CP-SAT model exact about the order rule (watermarks)
+  tube.py                tube LNS + long-budget restarts, opt-in via budget
+  verify.py              check stored routings with the organisers' scorer
   sabre_seed.py          Qiskit SABRE initial layouts as seeds, opt-in
   pipeline.py            one-command collect -> train -> distil -> score
 setup.sh                 venv + CUDA torch for a fresh Linux/NVIDIA box
   generate.py            random program generator / held-out test set
   eval.py                benchmark harness
 starter_kit/             organisers' code, vendored unmodified
+results/                 best verified routings found offline
+tests/                   exact-model and LNS regression tests (pytest)
 ```
 
 ## Running it
@@ -542,7 +601,10 @@ python -m qroute.train --preset small --distill-from models/value_base.pt --data
   (proved); the relaxed model admits depth-12 layouts ≤ 11.0, but none has
   yet been made emittable (20 min of lazy-ordering search at depth 12, and
   150 s rounds at 13–14, found none). Closing it needs longer proof runs.
-- **`dense_random` is plateaued at ~37** under every method tried: placement
+- **`dense_random` tube LNS is luck-dependent** (see *Tube LNS*): making it
+  reliable — more diverse starts, better CP-SAT parameters, adaptive tube
+  radius — is the most promising lever left.
+- **`dense_random` was plateaued at ~37** under every method tried before the tube: placement
   search + polish (60–300 s), whole-instance CP-SAT, window LNS, tail
   re-routing, longer paths, reverse-traversal seeding, per-core chains. The
   best ever seen is 36.5 (10-minute offline window LNS). Its analytical floor
