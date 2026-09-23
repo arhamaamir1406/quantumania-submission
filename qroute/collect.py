@@ -37,7 +37,7 @@ from .generate import random_program
 from .mdp import Problem, State
 from .placement import (constructive_placement, embed_placement,
                         identity_placement, random_placement)
-from .search import beam_search, gate_moves, greedy_rollout
+from .search import beam_search, gate_moves, greedy_rollout, wide_moves
 
 FEATURE_KEYS = ("node", "edge", "gate", "glob")
 INDEX_KEYS = ("gate_pa", "gate_pb")
@@ -68,11 +68,16 @@ def _final_stats(problem: Problem, s: State) -> tuple[float, float]:
 
 
 def label_cost_to_go(problem: Problem, s: State, width: int,
-                     max_paths: int) -> tuple[float, float] | None:
-    """(swaps_to_go, depth_to_go) from an independent beam started at `s`."""
+                     max_paths: int, wide: dict | None = None) -> tuple[float, float] | None:
+    """(swaps_to_go, depth_to_go) from an independent beam started at `s`.
+
+    With `wide` (beam_search kwargs: lookahead, prune, prune_fn, value_fn) the
+    label comes from the policy-pruned wide search, so a pre-positioning move
+    is valued by what further pre-positioning can make of it.
+    """
     if problem.is_terminal(s):
         return 0.0, 0.0
-    final = beam_search(problem, s, width=width, max_paths=max_paths)
+    final = beam_search(problem, s, width=width, max_paths=max_paths, **(wide or {}))
     if final is None:
         return None
     return float(final.swaps - s.swaps), float(final.depth - s.depth)
@@ -141,6 +146,7 @@ class _Accumulator:
     def __init__(self):
         self.rows: dict[str, list] = {k: [] for k in Shard.__dataclass_fields__}
         self.group = 0
+        self.n_pre = 0          # pre-positioning siblings attempted (for reporting)
 
     def add(self, enc: Encoder, states: list[State], labels: list[tuple],
             prog_id: int, same_group: bool):
@@ -175,7 +181,8 @@ class _Accumulator:
 def collect_one(prog, hw, rng, acc: _Accumulator, prog_id: int, *,
                 teacher_width: int, label_width: int, max_paths: int,
                 groups_per_program: int, siblings: int,
-                value_fn_factory=None) -> int:
+                value_fn_factory=None, lookahead: int = 0,
+                wide_labels: bool = False) -> int:
     """Collect from one program. Returns the number of examples added."""
     problem = Problem(prog, hw)
     if problem.n_ops == 0:
@@ -184,12 +191,16 @@ def collect_one(prog, hw, rng, acc: _Accumulator, prog_id: int, *,
     before = len(acc.rows["base_cost"])
 
     vf = value_fn_factory(problem) if value_fn_factory is not None else None
+    wide = (dict(lookahead=lookahead, prune=4, prune_fn=vf, value_fn=vf)
+            if wide_labels and vf is not None and lookahead > 0 else None)
     placement = rng.choice(_placements(prog, hw, rng))
     s0 = problem.initial(placement)
 
     # -- expert trajectory ------------------------------------------------
     if problem.is_terminal(s0):
         final = s0
+    elif wide is not None:
+        final = beam_search(problem, s0, width=teacher_width, max_paths=max_paths, **wide)
     else:
         final = beam_search(problem, s0, width=teacher_width, max_paths=max_paths,
                             value_fn=vf)
@@ -205,14 +216,26 @@ def collect_one(prog, hw, rng, acc: _Accumulator, prog_id: int, *,
     if interior and groups_per_program:
         picks = rng.sample(interior, min(groups_per_program, len(interior)))
         for s in picks:
-            moves = gate_moves(problem, s, max_paths)
+            if lookahead > 0:
+                # Wide groups for the pruning policy: half ordinary moves, half
+                # pre-positioning ones, so both are always represented.
+                narrow = gate_moves(problem, s, max_paths)
+                keys = {(t.k, t.pos) for t in narrow}
+                pre = [t for t in wide_moves(problem, s, max_paths, lookahead)
+                       if (t.k, t.pos) not in keys]
+                n_pre = min(len(pre), max(siblings // 2, siblings - len(narrow)))
+                moves = rng.sample(pre, n_pre)
+                moves += rng.sample(narrow, min(len(narrow), siblings - n_pre))
+                acc.n_pre += n_pre
+            else:
+                moves = gate_moves(problem, s, max_paths)
             if len(moves) < 2:
                 continue
             if len(moves) > siblings:
                 moves = rng.sample(moves, siblings)
             labelled, kept = [], []
             for t in moves:
-                lab = label_cost_to_go(problem, t, label_width, max_paths)
+                lab = label_cost_to_go(problem, t, label_width, max_paths, wide)
                 if lab is None:
                     continue
                 labelled.append(lab)
@@ -236,7 +259,8 @@ def _worker(job: dict):
     net_path = job["net_path"]
     if net_path and os.path.exists(net_path):
         try:
-            import torch  # noqa: F401
+            import torch
+            torch.set_num_threads(1)        # one core per worker; no oversubscription
             from .gnn import load_net, make_value_fn
             net = load_net(net_path, job["device"])
             if net is not None:
@@ -264,7 +288,9 @@ def _worker(job: dict):
                         label_width=job["label_width"],
                         max_paths=job["max_paths"],
                         groups_per_program=job["groups_per_program"],
-                        siblings=job["siblings"], value_fn_factory=factory)
+                        siblings=job["siblings"], value_fn_factory=factory,
+                        lookahead=job.get("lookahead", 0),
+                        wide_labels=job.get("wide_labels", False))
         except Exception:
             pass
         made += 1
@@ -273,7 +299,7 @@ def _worker(job: dict):
             got = len(acc.rows["base_cost"])
             frac = f"/{target}" if target else ""
             rate = got / max(1e-6, now - t0)
-            print(f"    [w{wid}] {got}{frac} states, {made} programs, "
+            print(f"    [w{wid}] {got}{frac} states ({acc.n_pre} pre-moves), {made} programs, "
                   f"{now - t0:.0f}s ({rate:.0f} states/s)", flush=True)
     return acc.shard()
 
@@ -299,7 +325,8 @@ def collect(n_programs: int = 10 ** 9, *, target_states: int | None = None,
             time_cap: float = 3600.0, workers: int = 0,
             net_path: str | None = None, device: str = "cpu",
             quantile: int | None = None, verbose: bool = True,
-            progress: float = 60.0) -> Shard:
+            progress: float = 60.0, lookahead: int = 0,
+            wide_labels: bool = False) -> Shard:
     """Generate a dataset across `workers` processes.
 
     Prefer `target_states` to `n_programs`: yield per program swings by an
@@ -320,7 +347,8 @@ def collect(n_programs: int = 10 ** 9, *, target_states: int | None = None,
                 label_width=label_width, max_paths=max_paths,
                 groups_per_program=groups_per_program, siblings=siblings,
                 time_cap=time_cap, net_path=net_path, device=device,
-                quantile=quantile, target_states=share,
+                quantile=quantile, target_states=share, lookahead=lookahead,
+                wide_labels=wide_labels,
                 n_programs=max(1, n_programs // workers),
                 progress=progress if verbose else 0.0)
     jobs = [dict(base, seed=seed + 1000 * w, wid=w) for w in range(workers)]

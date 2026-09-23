@@ -21,3 +21,8 @@ ortools>=9.10
 # ./setup.sh does this for you. `python -m qroute.pipeline` verifies it by
 # running a real kernel before it starts, not just torch.cuda.is_available().
 torch>=2.7
+
+# Qiskit is needed only for qroute/sabre_seed.py (SABRE initial layouts as
+# extra placement seeds, opt-in via use_sabre=True) and for reproducing the
+# SABRE comparison in the README. The portfolio runs without it.
+# qiskit>=2.0

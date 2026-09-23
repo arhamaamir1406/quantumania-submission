@@ -92,6 +92,22 @@ def load_value_net(device: str, paths: tuple[str, ...] | None = None):
     return net
 
 
+def _policy_fn(problem, path, device, verbose):
+    """The pruning policy's cost-to-go function, or None if unavailable."""
+    try:
+        from .gnn import load_net, make_value_fn
+        dev = _pick_device(device)
+        net = load_net(path, dev)
+        if net is None:
+            return None
+        return make_value_fn(net, problem, device=dev,
+                             max_batch=2048 if dev.startswith("cuda") else 256)
+    except Exception as exc:                  # torch missing, bad checkpoint, ...
+        if verbose:
+            print(f"    [policy] skipped: {exc}")
+        return None
+
+
 def solve(program: list[tuple], hardware_graph: nx.Graph, budget: float = 10.0,
           seeds: int = 48, beam_width: int = 1200, verbose: bool = False,
           net=None, net_device: str | None = None, net_quantile: int | None = None,
@@ -99,7 +115,10 @@ def solve(program: list[tuple], hardware_graph: nx.Graph, budget: float = 10.0,
           use_net: bool = True, placement_share: float = 0.65,
           polish_share: float = 0.9, workers: int | None = None, seed: int = 0xC0FFEE,
           use_exact: bool = True, exact_max_gates: int = 24, exact_share: float = 0.5,
-          use_window: bool = False, window_share: float = 0.4, window_size: int = 12):
+          use_window: bool = False, window_share: float = 0.4, window_size: int = 12,
+          use_sabre: bool = False, sabre_share: float = 0.08,
+          use_policy: bool = False, policy_path: str = "models/policy_small.pt",
+          policy_share: float = 0.5, policy_prune: int = 4, policy_lookahead: int = 4):
     """Returns (initial_placement, routed_program)."""
     t0 = time.monotonic()
     rng = random.Random(seed)
@@ -163,6 +182,14 @@ def solve(program: list[tuple], hardware_graph: nx.Graph, budget: float = 10.0,
         extra = [("identity", identity_placement(program, hardware_graph))]
         if emb is not None:
             extra.append(("embed-seed", emb))
+        if use_sabre:
+            # Qiskit SABRE's initial layouts as extra seeds (optional dependency).
+            from . import sabre_seed
+            if sabre_seed.available():
+                for i, pl in enumerate(sabre_seed.sabre_placements(
+                        program, hardware_graph, time.monotonic() + budget * sabre_share,
+                        seed=rng.randrange(1 << 30))):
+                    extra.append((f"sabre{i}", pl))
         scored_placements = search_placements(
             program, hardware_graph, deadline=t0 + budget * placement_share, rng=rng,
             offer=offer, extra=extra, workers=workers)
@@ -181,9 +208,36 @@ def solve(program: list[tuple], hardware_graph: nx.Graph, budget: float = 10.0,
             if len(top) >= 12:
                 break
         tags = {tuple(sorted(pl.items())): tag for tag, pl in top}
-        polish(problem, [pl for _, pl in top], deadline=t0 + budget * polish_share,
+        polish_end = t0 + budget * polish_share
+        pvf = None
+        if use_policy:
+            pvf = _policy_fn(problem, policy_path, net_device, verbose)
+            if pvf is not None:
+                # Split the polish window: plain polish first, then the pruned
+                # wide-move search on the same placements.
+                start = t0 + budget * placement_share
+                polish_end = start + (polish_end - start) * (1 - policy_share)
+        polish(problem, [pl for _, pl in top], deadline=polish_end,
                incumbent=best.score if best else INF,
                on_improve=lambda pl, ops: offer(pl, ops, f"polish/{tags[tuple(sorted(pl.items()))]}"))
+
+        # -- policy-pruned wide search: pre-positioning moves ----------------
+        # The wide move set adds SWAPs that start moving qubits for the next
+        # few gates. Under the hand-written heuristic it loses (that heuristic
+        # overrates those moves and they crowd the beam), pruned or not. The
+        # policy net both prunes (each parent keeps its best few) and ranks.
+        if pvf is not None:
+            end = t0 + budget * polish_share
+            for w in (8, 16, 32, 64, 128, 256):
+                for tag, pl in top[:6]:
+                    if time.monotonic() > end:
+                        break
+                    s = beam_search(problem, problem.initial(pl), width=w,
+                                    incumbent=best.score if best else INF,
+                                    lookahead=policy_lookahead, prune=policy_prune,
+                                    prune_fn=pvf, value_fn=pvf, deadline=end)
+                    if s is not None:
+                        offer(pl, s.ops(), f"policy{w}/{tag}")
 
         # -- exact layered model (CP-SAT), seeded with the incumbent --------
         # A different search space: any SWAP on any edge in any layer. It

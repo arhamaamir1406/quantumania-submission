@@ -251,10 +251,22 @@ def main():
     ap.add_argument("--groups-per-program", type=int, default=6)
     ap.add_argument("--siblings", type=int, default=8)
     ap.add_argument("--max-qubits", type=int, default=20)
+    ap.add_argument("--lookahead", type=int, default=0,
+                    help="sibling groups over the wide move set (pre-positioning "
+                         "SWAPs for the next N gates); trains a pruning policy")
     ap.add_argument("--collect-cap", type=float, default=14400.0,
                     help="per-worker wall-clock cap on collection, seconds")
     ap.add_argument("--data", default=None, help="reuse a saved .npz dataset")
     ap.add_argument("--save-data", default=None)
+    ap.add_argument("--drive", default=None,
+                    help="net that drives round-0 collection (teacher + labels)")
+    ap.add_argument("--wide-labels", action="store_true",
+                    help="with --lookahead: label siblings with the driving net's "
+                         "pruned wide search, not the narrow beam")
+    ap.add_argument("--collect-device", default="cpu",
+                    help="device for the driving net inside collection workers")
+    ap.add_argument("--extra-data", default=None,
+                    help="an earlier .npz dataset to train on alongside the new one")
     ap.add_argument("--dagger", type=int, default=0,
                     help="extra collect+train rounds driven by the current net")
     # model
@@ -330,7 +342,7 @@ def main():
             shard = Shard.load(args.data)
             print(f"  {len(shard)} states")
         else:
-            drive = str(out_path) if rnd > 0 and out_path.exists() else None
+            drive = str(out_path) if rnd > 0 and out_path.exists() else args.drive
             print(f"[round {rnd}] collecting {args.target_states:,} states on "
                   f"{args.workers} workers" + (f", driven by {drive}" if drive else ""))
             shard = collect(args.programs, target_states=args.target_states,
@@ -340,12 +352,17 @@ def main():
                             label_width=args.label_width, max_paths=args.max_paths,
                             groups_per_program=args.groups_per_program,
                             siblings=args.siblings, time_cap=args.collect_cap,
-                            workers=args.workers, net_path=drive, device="cpu")
+                            workers=args.workers, net_path=drive,
+                            device=args.collect_device,
+                            lookahead=args.lookahead, wide_labels=args.wide_labels)
             if args.save_data and rnd == 0:
                 Path(args.save_data).parent.mkdir(parents=True, exist_ok=True)
                 shard.save(args.save_data)
                 print(f"  saved {args.save_data}")
 
+        if args.extra_data and rnd == 0:
+            shard = Shard.concat([shard, Shard.load(args.extra_data)])
+            print(f"  + {args.extra_data}: {len(shard)} states total")
         data = DeviceData(shard, dev)
         n = len(shard)
         y = shard.y_swaps + 0.5 * shard.y_depth
