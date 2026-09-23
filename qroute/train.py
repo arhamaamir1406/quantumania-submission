@@ -263,6 +263,8 @@ def main():
     ap.add_argument("--wide-labels", action="store_true",
                     help="with --lookahead: label siblings with the driving net's "
                          "pruned wide search, not the narrow beam")
+    ap.add_argument("--collect-progress", type=float, default=60.0,
+                    help="seconds between per-worker collection progress lines")
     ap.add_argument("--collect-device", default="cpu",
                     help="device for the driving net inside collection workers")
     ap.add_argument("--extra-data", default=None,
@@ -354,7 +356,8 @@ def main():
                             siblings=args.siblings, time_cap=args.collect_cap,
                             workers=args.workers, net_path=drive,
                             device=args.collect_device,
-                            lookahead=args.lookahead, wide_labels=args.wide_labels)
+                            lookahead=args.lookahead, wide_labels=args.wide_labels,
+                            progress=args.collect_progress)
             if args.save_data and rnd == 0:
                 Path(args.save_data).parent.mkdir(parents=True, exist_ok=True)
                 shard.save(args.save_data)

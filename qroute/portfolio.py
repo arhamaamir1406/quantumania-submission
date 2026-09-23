@@ -117,7 +117,7 @@ def solve(program: list[tuple], hardware_graph: nx.Graph, budget: float = 10.0,
           use_exact: bool = True, exact_max_gates: int = 24, exact_share: float = 0.5,
           use_window: bool = False, window_share: float = 0.4, window_size: int = 12,
           use_sabre: bool = False, sabre_share: float = 0.08,
-          use_policy: bool = False, policy_path: str = "models/policy_small.pt",
+          use_policy: bool = True, policy_path: str = "models/policy_small_r2.pt",
           policy_share: float = 0.5, policy_prune: int = 4, policy_lookahead: int = 4):
     """Returns (initial_placement, routed_program)."""
     t0 = time.monotonic()

@@ -3,8 +3,8 @@
 Placement, routing and scheduling for the Quantum Coalition challenge at
 Q-SITE 2026.
 
-**Current result: 69.0 across the six public benchmarks, down from the
-provided baseline's 283.5 (−75.7%). All six validate, and four are provably
+**Current result: 67.5 across the six public benchmarks, down from the
+provided baseline's 283.5 (−76.2%). All six validate, and four are provably
 optimal** (`ghz_star`, `chain_trotter`, `ladder_trotter`, `vqe_layers`).
 
 | benchmark | 2Q gates | baseline | ours | swaps | depth | floor | proven optimal |
@@ -13,13 +13,15 @@ optimal** (`ghz_star`, `chain_trotter`, `ladder_trotter`, `vqe_layers`).
 | `chain_trotter` | 9 | 15.0 | **4.5** | 0 | 9 | 4.5 | yes — embeds |
 | `ladder_trotter` | 16 | 35.5 | **6.5** | 3 | 7 | 4.0 | yes — `qroute.certify`, 11 s |
 | `qaoa_random` | 18 | 39.0 | 11.5 | 7 | 9 | 5.0 | no ≤ 11.0 up to depth 11; none found at 12–14 |
-| `dense_random` | 40 | 122.0 | 37.0 | 26 | 22 | 10.0 | — |
+| `dense_random` | 40 | 122.0 | 35.5 | 24 | 23 | 10.0 | — |
 | `vqe_layers` | 45 | 58.0 | **3.0** | 0 | 6 | 3.0 | yes — embeds |
-| **total** | 135 | **283.5** | **69.0** | 38 | | 33.0 | |
+| **total** | 135 | **283.5** | **67.5** | 36 | | 33.0 | |
 
 Measured with the default 60 s budget per benchmark on 24 cores.
-`dense_random` varies between runs (37.0–39.0); the other five return the
-same score every run. `floor` is the analytical bound from `qroute/bounds.py`;
+`dense_random` varies between runs (35.5–39.0 over 16 runs, 35.5 four times,
+median 37.5) — the placement search is multi-process, so the same seed
+explores a different path each run; the other five return the same score
+every run. `floor` is the analytical bound from `qroute/bounds.py`;
 the last column adds the computational proofs from `qroute/certify.py`.
 
 `floor` is a provable lower bound, computed by `qroute/bounds.py` — see
@@ -39,9 +41,12 @@ the external reference point. 2000 seeds per benchmark, 20 layout trials and
 | `chain_trotter` | 4.5 | 4.5 | 4.5 |
 | `ladder_trotter` | 6.5 | 6.5 | 6.5 |
 | `qaoa_random` | 12.0 | 11.0 | **11.5** |
-| `dense_random` | 43.5 | 36.0 | **~37** |
+| `dense_random` | 43.5 | 36.0 | **35.5** |
 | `vqe_layers` | 3.0 | 3.0 | 3.0 |
-| **total** | **76.0** | 67.5 | **69.0** |
+| **total** | **76.0** | 67.5 | **67.5** |
+
+With the pruning policy on, `dense_random` now lands below SABRE's
+order-relaxed 36.0 *while obeying the order rule*.
 
 SABRE routes the circuit's dependency DAG, which is *weaker* than this
 challenge's rule: the scorer requires the exact program order, including
@@ -91,8 +96,8 @@ to about `⌈(d−1)/2⌉`.
 
 ### Wide move set: pre-positioning SWAPs
 
-`search.py` also offers a wider move set (`lookahead=N`, off by default): each
-successor may be preceded by one **pre-positioning SWAP** — one that shortens
+`search.py` also offers a wider move set (`lookahead=N`, used by the policy
+stage and off elsewhere): each successor may be preceded by one **pre-positioning SWAP** — one that shortens
 any of the next `N` gates and touches neither of the active gate's qubits.
 Chained across rounds, these start moving qubits for gates that are still
 several rounds away, which the narrow move set (shortest paths for the active
@@ -289,8 +294,9 @@ large teacher, which is how a CPU-affordable checkpoint is produced.
 
 ### Pruning policy
 
-A second, separately trained checkpoint (`models/policy_small.pt`, `small`
-preset, 2.2M parameters) exists for the wide move set. Same architecture and
+A second, separately trained checkpoint (`models/policy_small_r2.pt`, `small`
+preset, 2.2M parameters) drives the wide move set; round 1's
+`models/policy_small.pt` is kept for comparison. Same architecture and
 the same three losses; what differs is the data and the job it does in search:
 
 * **Data** — `collect.py --lookahead N` builds sibling groups over the *wide*
@@ -302,9 +308,9 @@ the same three losses; what differs is the data and the job it does in search:
   extras, *plus* all of its ordinary moves, so pruning can only add candidates
   to the narrow search, never remove them. The same net then ranks the beam.
 
-Held-out decision accuracy 0.835, regret 0.377. From fixed placements it is
-the first thing that makes pre-positioning pay, and it also edges out the 18M
-value net at a ninth of the size:
+From fixed placements it is the first thing that makes pre-positioning pay,
+and it also edges out the 18M value net at a ninth of the size (round-1
+checkpoint, held-out decision accuracy 0.835, regret 0.377):
 
 | mean / best over 10 placements | heuristic | 18M value net | policy, narrow | policy, wide + prune |
 |---|---|---|---|---|
@@ -312,18 +318,30 @@ value net at a ninth of the size:
 | `qaoa_random` (w64) | 21.95 / 18.5 | 21.65 / 18.5 | 21.65 / 18.5 | **20.95 / 17.5** |
 | `ladder_trotter` (w64) | 18.00 / 15.0 | 17.80 / 15.0 | 17.75 / 15.0 | **17.15 / 14.5** |
 
-> **Status: opt-in (`use_policy=False`), because it does not move the final
-> score.** A/B at the 60 s budget, policy stage on vs off: 1 win, 6 ties, 0
-> losses (`dense_random` seeds 1-4: 37.5/37.5, 37.5/37.5, 39.0/39.0,
-> 40.0/**39.0**; `qaoa_random` and `ladder_trotter` unchanged). The gain above
-> is measured from *sampled* placements; by the time placement search and
-> polish have run, the states it wins are already reached another way.
+> **Status: on by default (`use_policy=True`), after a second training
+> round.** Round 1 labelled every sibling with a *narrow* beam, so the net
+> learned what a pre-move is worth when only ordinary moves follow it — that
+> version tied at the 60 s budget (1 win, 6 ties, 0 losses). Round 2
+> re-collected with `--wide-labels`: the policy's own pruned wide search
+> computes the labels, so pre-moves are valued by what further pre-moves can
+> make of them. 143,835 new states (12,867 groups) on 8 GPU workers in 45 min,
+> trained on those plus round 1 (1.34M total). Validation regret 0.377 ->
+> **0.326**, decision accuracy 0.838.
 >
-> The likely ceiling is the labels: cost-to-go is computed by a *narrow*
-> beam, so the net learns what a pre-move is worth when only ordinary moves
-> follow it, not how pre-moves compose. Re-collecting with the policy's own
-> wide search as the labeller (`--wide-labels`, implemented, not yet run to
-> completion) is the untried next step.
+> That version moves the score. A/B at 60 s on `dense_random`, 6 seeds:
+> **4 wins, 1 tie, 1 loss** (39.5/**37.5**, 37.5/37.5, 39.0/**37.5**,
+> 37.5/**35.0**, 39.5/**37.5**, **37.0**/37.5), and the policy stage itself
+> produced the winning candidate in 4 of the 6. Over 16 further runs the new
+> best is **35.5** (24 swaps, depth 23; four times, median 37.5) against a
+> previous best of 36.5 that needed 10 minutes offline. `qaoa_random`,
+> `ladder_trotter` and the three optimal benchmarks are unchanged.
+>
+> Runs are not reproducible seed-for-seed: the placement search is
+> multi-process, so the same seed takes a different path each run. Every
+> score quoted here was validated by the organisers' scorer.
+>
+> Without `torch`, or without the checkpoint, the stage is skipped silently
+> and the total returns to ~69.0.
 
 ### Inference cost
 
@@ -542,15 +560,17 @@ python -m qroute.train --preset small --distill-from models/value_base.pt --data
   (proved); the relaxed model admits depth-12 layouts ≤ 11.0, but none has
   yet been made emittable (20 min of lazy-ordering search at depth 12, and
   150 s rounds at 13–14, found none). Closing it needs longer proof runs.
-- **`dense_random` is plateaued at ~37** under every method tried: placement
-  search + polish (60–300 s), whole-instance CP-SAT, window LNS, tail
-  re-routing, longer paths, reverse-traversal seeding, per-core chains. The
-  best ever seen is 36.5 (10-minute offline window LNS). Its analytical floor
-  (10.0) is far too loose to say how much of the gap is real.
-- **Pre-positioning is only half-tested.** The policy-pruned wide search wins
-  from sampled placements but not from polished ones, and its labels come
-  from a narrow beam (see *Pruning policy*). `--wide-labels` re-collection is
-  implemented but was never run to completion.
+- **`dense_random` sat at ~37 under every non-learned method tried**:
+  placement search + polish (60–300 s), whole-instance CP-SAT, window LNS,
+  tail re-routing, longer paths, reverse-traversal seeding, per-core chains,
+  SABRE seeding. The policy-pruned wide search broke that plateau (35.5), so
+  the move set, not the placement, was the binding constraint there. Its
+  analytical floor (10.0) is still far too loose to say what remains.
+- **A third policy round.** Round 2 (`--wide-labels`) took `dense_random`
+  from ~37.5 to 35.5; its labels are now the *round-1* policy's searches, so
+  the same trick can be iterated with round 2 as the labeller. Whether that
+  keeps paying is untested. Validation regret still bottoms out around epoch
+  15-20 and then drifts up, so more epochs are not the lever.
 - **SABRE's relaxed 36.0 on `dense_random`** is not reachable under the order
   rule: its solutions run a later gate before a SWAP an earlier gate needs, so
   no reordering of those ops is legal. Seeding our search with SABRE's initial
