@@ -8,7 +8,7 @@ portfolio by 0.5-5.5 points per instance. Good placements are rare (2-15% of
 samples beat the old result), so we need volume, and a narrow beam is cheap
 enough (1-60 ms) to be the placement's fitness function.
 
-Two stages, both parallel across processes when fork is available:
+Two stages, both parallel across a process pool (fork, or spawn on Windows):
 
 1. **Sampling** -- jittered constructive placements at a spread of jitter
    levels, each scored by a narrow beam.
@@ -66,18 +66,48 @@ def _task(placement):
     return _evaluate(_P, placement)
 
 
-class Evaluator:
-    """Scores placements, in a fork pool when possible, serially otherwise."""
 
-    def __init__(self, program, hw, workers: int | None = None):
+def _spawn_pool(workers: int, program, hw):
+    """A spawn-context pool that never re-imports the caller's __main__.
+
+    Spawned workers normally re-import the parent's __main__. From a REPL,
+    stdin or notebook there is nothing to import, and from a caller's script
+    without an `if __name__ == "__main__"` guard the import re-runs that
+    script; either way each worker dies during bootstrap and the pool respawns
+    it forever. The workers only need this module, which they import by name,
+    so __main__ is swapped for an empty module while they start.
+    """
+    import sys
+    import types
+    real = sys.modules.get("__main__")
+    sys.modules["__main__"] = types.ModuleType("__main__")
+    try:
+        return mp.get_context("spawn").Pool(workers, _init, (program, hw))
+    finally:
+        if real is not None:
+            sys.modules["__main__"] = real
+
+
+class Evaluator:
+    """Scores placements in a process pool when possible, serially otherwise.
+
+    fork where available (Linux); spawn otherwise (Windows, where there is no
+    fork -- without it the whole placement search ran on one core there).
+    Spawn workers cost ~1 s to start, so they are skipped for short budgets.
+    """
+
+    def __init__(self, program, hw, workers: int | None = None, allow_spawn: bool = True):
         self.problem = Problem(program, hw)
         self.pool = None
         if workers is None:
             workers = max(1, (os.cpu_count() or 1) - 1)
-        if workers > 1 and "fork" in mp.get_all_start_methods():
+        if workers > 1:
             try:
-                self.pool = mp.get_context("fork").Pool(workers, _init, (program, hw))
-            except (OSError, ValueError):
+                if "fork" in mp.get_all_start_methods():
+                    self.pool = mp.get_context("fork").Pool(workers, _init, (program, hw))
+                elif allow_spawn:
+                    self.pool = _spawn_pool(workers, program, hw)
+            except (OSError, ValueError, RuntimeError):
                 self.pool = None
         # Neighbour batch size for local search: one round of the pool, or a
         # handful of evaluations when serial.
@@ -188,7 +218,7 @@ def search_placements(program, hw, deadline: float, rng: random.Random,
     Returns the placements sorted by score, best first, as (cost, tag, placement).
     """
     t_start = time.monotonic()
-    ev = Evaluator(program, hw, workers)
+    ev = Evaluator(program, hw, workers, allow_spawn=deadline - t_start > 6.0)
     try:
         tagged = list(extra) + [(f"sample{i}", pl)
                                 for i, pl in enumerate(sample_placements(program, hw, rng, n_samples))]
