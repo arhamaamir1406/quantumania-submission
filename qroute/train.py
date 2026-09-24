@@ -267,6 +267,9 @@ def main():
                     help="seconds between per-worker collection progress lines")
     ap.add_argument("--collect-device", default="cpu",
                     help="device for the driving net inside collection workers")
+    ap.add_argument("--data-frac", type=float, default=1.0,
+                    help="train on this fraction of the dataset, split by program "
+                         "(for data-scaling ablations)")
     ap.add_argument("--extra-data", default=None,
                     help="an earlier .npz dataset to train on alongside the new one")
     ap.add_argument("--dagger", type=int, default=0,
@@ -366,6 +369,15 @@ def main():
         if args.extra_data and rnd == 0:
             shard = Shard.concat([shard, Shard.load(args.extra_data)])
             print(f"  + {args.extra_data}: {len(shard)} states total")
+        if args.data_frac < 1.0:
+            # Subsample by program so sibling groups stay intact.
+            progs = np.unique(shard.prog_id)
+            keep = set(np.random.default_rng(args.seed).choice(
+                progs, max(1, int(len(progs) * args.data_frac)), replace=False).tolist())
+            m = np.array([p in keep for p in shard.prog_id])
+            shard = Shard(**{k: getattr(shard, k)[m] for k in Shard.__dataclass_fields__})
+            print(f"  data-frac {args.data_frac}: {len(shard)} states, "
+                  f"{len(keep)} programs")
         data = DeviceData(shard, dev)
         n = len(shard)
         y = shard.y_swaps + 0.5 * shard.y_depth

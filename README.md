@@ -620,8 +620,10 @@ python -m qroute.train --preset small --distill-from models/value_base.pt --data
 - **`qaoa_random` optimality.** No solution ≤ 11.0 exists with depth ≤ 11
   (proved). The watermark model, which encodes the order rule exactly, ran 30
   minutes warm-started at 11.5 and finished FEASIBLE, not OPTIMAL: the
-  certified bound rose 5.0 -> **8.5** and the gap to 11.5 is now 3.0. Closing
-  it needs a longer run or a tighter formulation, not a different search.
+  certified bound rose 5.0 -> **8.5** and the gap to 11.5 is now 3.0. An
+  80-minute rerun, again warm-started at 11.5, ended identically (FEASIBLE,
+  bound 8.5): more time does not move it. Closing the gap needs a tighter
+  formulation (symmetry breaking, stronger cuts), not a longer run.
 - **`dense_random` sat at ~37 under every non-learned method tried**:
   placement search + polish (60–300 s), whole-instance CP-SAT, window LNS,
   tail re-routing, longer paths, reverse-traversal seeding, per-core chains,
@@ -635,11 +637,22 @@ python -m qroute.train --preset small --distill-from models/value_base.pt --data
   worse than a single 60 s policy run. The two methods plateau at nearly the
   same place from different directions; making the tube escape a good
   incumbent (more diverse starts, adaptive radius) is the live lever.
-- **A third policy round.** Round 2 (`--wide-labels`) took `dense_random`
-  from ~37.5 to 35.5; its labels are the *round-1* policy's searches, so the
-  same trick can be iterated with round 2 as the labeller. Untested.
-  Validation regret bottoms out around epoch 15-20 and then drifts up, so
-  more epochs are not the lever.
+- **The learned side of `dense_random` looks exhausted** at this net size and
+  budget. Two follow-ups to round 2 were both flat:
+  * *More data.* The policy retrained from scratch on 12.5 / 25 / 50 / 100 %
+    of the 1.34M states (30 epochs each) reached best validation regret 0.387
+    / 0.440 / 0.371 / 0.420 — no trend (decision accuracy 0.80-0.83
+    throughout). More data only delays overfitting: at 12.5 % regret climbs
+    from epoch 10, at 50 %+ it is still falling at epoch 30. Each fraction
+    validates on its own held-out programs, so differences of ~0.05 are
+    noise; the flat trend is not. (`train.py --data-frac`.)
+  * *A third relabelling round.* The round-2 policy labelled 141k fresh
+    states, trained on those plus round 2's. Validation regret 0.272, but on
+    an easier validation mix and not comparable to round 2's 0.326; it peaked
+    at epoch 5. A/B at 60 s, 10 dense seeds, r2 vs r3: best 36.5 / 36.5,
+    median 37.5 / 38.0, mean 37.85 / 37.90 — a tie. Round 2 worked because
+    its labels switched from narrow to wide search; round 3 only swapped in a
+    slightly better labeller of the same kind. Round 2 stays the default.
 - **SABRE's relaxed 36.0 on `dense_random`** is not reachable under the order
   rule: its solutions run a later gate before a SWAP an earlier gate needs, so
   no reordering of those ops is legal. Seeding our search with SABRE's initial
