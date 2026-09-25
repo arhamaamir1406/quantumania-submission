@@ -4,27 +4,32 @@ Placement, routing and scheduling for the Quantum Coalition challenge at
 Q-SITE 2026.
 
 **Best verified result: 67.0 across the six public benchmarks, down from the
-provided baseline's 283.5 (−76.4%). All six validate, and four are provably
-optimal** (`ghz_star`, `chain_trotter`, `ladder_trotter`, `vqe_layers`).
-`dense_random`'s 35.0 is the best of 60 policy runs at the 60 s budget; a
-single run returns 35.5–38.5 (median 37.5). It and `qaoa_random`'s 11.5 are
-stored in `results/`, checkable with `python -m qroute.verify results/*.json`.
+provided baseline's 283.5 (−76.4%). All six validate, and five are provably
+optimal** (`ghz_star`, `chain_trotter`, `ladder_trotter`, `qaoa_random`,
+`vqe_layers`); only `dense_random` is open.
+`dense_random`'s 35.0 is the best seen at the 60 s budget; one 60 s call to
+`submission.solve` returns 35.5 almost every time with a GPU (mean 35.56). It and
+`qaoa_random`'s 11.5 are stored in `results/`, checkable with
+`python -m qroute.verify results/*.json`.
 
 | benchmark | 2Q gates | baseline | ours | swaps | depth | floor | proven optimal |
 |---|---|---|---|---|---|---|---|
 | `ghz_star` | 7 | 14.0 | **6.5** | 2 | 9 | 6.5 | yes — coupled hub bound |
 | `chain_trotter` | 9 | 15.0 | **4.5** | 0 | 9 | 4.5 | yes — embeds |
 | `ladder_trotter` | 16 | 35.5 | **6.5** | 3 | 7 | 4.0 | yes — `qroute.certify`, 11 s |
-| `qaoa_random` | 18 | 39.0 | 11.5 | 7 | 9 | 8.5¹ | no ≤ 11.0 up to depth 11; none found at 12–14 |
+| `qaoa_random` | 18 | 39.0 | **11.5** | 7 | 9 | 8.5¹ | yes — depth-sliced watermark proof |
 | `dense_random` | 40 | 122.0 | **35.0** | 24 | 22 | 10.0 | — |
 | `vqe_layers` | 45 | 58.0 | **3.0** | 0 | 6 | 3.0 | yes — embeds |
-| **total** | 135 | **283.5** | **67.0** | 36 | | 36.5 | |
+| **total** | 135 | **283.5** | **67.0** | 36 | | 36.5 | 31.5 of 67.0 proven optimal |
 
 Measured with the default 60 s budget per benchmark on 24 cores.
-`dense_random` varies between runs (35.0–38.5 over 60 runs, median 37.5;
-35.0 once, 35.5 several times) — the placement search is multi-process, so
-the same seed explores a different path each run; the other five return the
-same score every run. `floor` is the analytical bound from `qroute/bounds.py`
+`dense_random` varies between runs — the placement search is multi-process,
+so the same seed explores a different path each run; the other five return
+the same score every run. Through `submission.solve` (three parallel runs,
+best kept; see *Parallel runs and the no-GPU path*) a 60 s run gives
+**35.56 on average** (35.5 in 7 of 8 trials, never above 36.0) with a GPU —
+measured with best-of-3 as 35.75 — and **37.8**
+(37.0–39.5, on time at 56 s) without one; the stored 35.0 is the best seen. `floor` is the analytical bound from `qroute/bounds.py`
 except ¹: 8.5, raised from the analytical 5.0 by a 30-minute certified run of
 the watermark model (`qroute/watermark.py`), which holds for every routing,
 not just within a horizon. The last column adds the computational proofs from
@@ -141,6 +146,48 @@ Every strategy runs, self-scores, and the best valid candidate wins:
    (12.0) to 7 SWAPs/depth 9 (11.5). See *Exact model* below.
 6. **The provided baseline**, kept as a safety net — so the result can never
    be worse than it, and never invalid.
+
+### Parallel runs and the no-GPU path
+
+`submission.solve` wraps the portfolio in two outer layers
+(`qroute/parallel.py`, `qroute/tube.py`):
+
+* **Best of K in parallel** for programs over 24 gates. One portfolio run
+  leaves most of a 24-core machine idle — its policy stage is largely serial
+  work on the GPU — so splitting the cores costs a run nothing
+  (`dense_random`, 60 s: 36.22 mean on all cores, 36.28 on 6), and the best
+  of three independent runs is both better and far steadier:
+
+  | `dense_random`, 60 s | mean | worst |
+  |---|---|---|
+  | one run, all cores (16 seeds) | 36.22 | 38.5 |
+  | best of 3, 6 cores each (6 trials) | 35.75 | 36.5 |
+  | **best of 4, 6 cores each** (8 trials) | **35.56** | **36.0** |
+
+  Best of 4 against best of 3 on the same seeds: 3 wins, 5 ties, no losses;
+  it lands on 35.5 in 7 of 8 trials. The number of runs follows the core
+  count (6 cores per run, at most 4), so
+  a small machine falls back to one run, and any failure in the parallel
+  path falls back to one run as well.
+* **No GPU: the learned stages switch off.** On CPU the policy is ~30× slower
+  and both learned stages cost score *and* time (`dense_random`, one run:
+  39.5 at ~62 s with them, 38.2 at 54 s without), so without CUDA the
+  portfolio drops them and gives their time to polish. A CPU-only machine
+  then scores 37.8 on `dense_random` (best of 3, varied seeds), on time.
+  With a GPU the learned stages stay: best of 3 with them beat best of 3
+  without in all three trials, by 3–3.5 points.
+* **Budgets above 120 s: independent restarts.** A single run plateaus by
+  ~120 s — every stage has finished by ~248 s of a 300 s budget — so extra
+  time is spent on fresh 60 s restarts, keeping the best:
+
+  | `dense_random` | mean |
+  |---|---|
+  | one run, 60 s / 120 s / 300 s | 38.0 / 37.0 / 37.0 |
+  | 300 s of 60 s restarts | **35.67** |
+  | 300 s of restarts + tube LNS | 35.83 |
+
+  The tube adds nothing on top of restarts, so it is now opt-in
+  (`solve_long(..., use_tube=True)`) and this path no longer needs OR-Tools.
 
 ### Placement search
 
@@ -351,6 +398,35 @@ checkpoint, held-out decision accuracy 0.835, regret 0.377):
 > Without `torch`, or without the checkpoint, the stage is skipped silently
 > and the total returns to ~69.0.
 
+### Forward-backward refinement
+
+SABRE's own trick — route forward, take the final mapping, route the
+*reversed* program from it, and start again from where that ends — did
+nothing with the hand-written router. With the policy as the router it is
+strong: it improves 40 of 41 random placements (by 13.7 points on average)
+and every one of the placement search's own top 12 (`dense_random`: best
+38.5 → 36.5 at width 16, in ~15 s). The policy stage now refines its six
+placements this way before the wide beams (`use_fb`, 3 passes), with the
+stage given more of the budget (`policy_share` 0.5 → 0.8). A/B at 60 s,
+16 seeds: **13 wins, 1 loss, 2 ties**, mean 37.50 → 36.22, median 37.5 →
+36.25. The longer window alone accounts for part of that (8-seed A/B: 36.94
+→ 36.56); the refinement is the rest.
+
+Three neighbouring ideas were measured and dropped:
+
+* **Tree search (MCTS) over routing.** On the best placement, a policy beam
+  of width 16 already finds 35.0 and width 4096 finds nothing better; the
+  routing is saturated, so smarter routing search has nothing to find.
+* **Choosing placements by the policy.** The heuristic router and the policy
+  rank placements very differently (rank correlation 0.40; their top-12
+  lists share one placement), but a placement search with the policy as
+  fitness is too slow to beat what we have (10 min from 35.0: no gain), and
+  re-ranking a wider pool inside the 60 s budget loses to the time it costs
+  (pool of 48: 3 losses, 1 tie; pool of 12: 4-4-2, within noise).
+  `policy_pool` stays available, off.
+* **Less time for the placement search** (share 0.65 → 0.45, 12 seeds):
+  37.17 vs 37.21 — no effect.
+
 ### Inference cost
 
 An 18M-parameter forward pass is ~3 ms/state on CPU and ~30 µs on a GPU, so
@@ -480,11 +556,31 @@ or nothing, and a 900 s `solve_long` run (portfolio restarts + tube) ended at
 39.5. So it is opt-in — `submission.solve(program, hw, budget=900)` uses it
 for programs over 24 gates — and the 60 s default is unchanged.
 
-Two things did not pay off and are not shipped: exact per-segment SWAP
-bounds (the layered model proves them too weakly — bound 1 against a true
-2–3 on 14-gate `dense_random` segments), and depth-sliced proofs of
-`qaoa_random` (depths 19–20 are infeasible at ≤ 11.0 in seconds, but depths
-12–18 stay UNKNOWN after 5–25 minutes each).
+Exact per-segment SWAP bounds did not pay off and are not shipped (the
+layered model proves them too weakly — bound 1 against a true 2–3 on 14-gate
+`dense_random` segments).
+
+**Depth-sliced proof of `qaoa_random`.** The approach of the depth-optimal
+SAT tools (QuilLS, Q-Synth): instead of one optimisation, ask one yes/no
+question per depth — "is there a valid routing with depth exactly D scoring
+≤ 11.0?" (`fix_depth`, with `upper=11.0`). Depths ≤ 11 were already refuted;
+a score ≤ 11.0 needs depth ≤ 20, so nine slices remain. Given enough workers
+and time they fall:
+
+| depth | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 |
+|---|---|---|---|---|---|---|---|---|---|
+| verdict | infeasible | infeasible | infeasible | infeasible | infeasible | infeasible | infeasible | infeasible | infeasible |
+| time | 61 min, 4 w | 60 min, 4 w | 126 min, 6 w | 21 min, 6 w | 47 min, 6 w | 81 min, 2 w | 110 min, 2 w | 2.4 min | 3.7 min |
+
+Every slice is infeasible, so **`qaoa_random`'s 11.5 is optimal**: no valid
+routing scores ≤ 11.0 at any depth (a score ≤ 11.0 needs depth ≤ 20, since
+at least one SWAP is forced, and depths ≤ 11 were refuted by the relaxed
+model, whose infeasibility implies the exact problem's). Worker count
+mattered more than time: 14, 15 and 16 were still UNKNOWN after 2 h on 2
+workers each; on 6 they closed in 126, 21 and 47 minutes. The earlier single
+80-minute optimisation never moved past a bound of 8.5. Reproduce a slice
+with `solve_exact(program, hw, horizon=D, fix_depth=D, upper=11.0,
+swap_floor=1, workers=6)`.
 
 ## Correctness
 
@@ -528,6 +624,7 @@ qroute/
   tube.py                tube LNS + long-budget restarts, opt-in via budget
   verify.py              check stored routings with the organisers' scorer
   sabre_seed.py          Qiskit SABRE initial layouts as seeds, opt-in
+  parallel.py            best-of-K parallel portfolio runs (submission path)
   pipeline.py            one-command collect -> train -> distil -> score
 setup.sh                 venv + CUDA torch for a fresh Linux/NVIDIA box
   generate.py            random program generator / held-out test set
@@ -617,13 +714,6 @@ python -m qroute.train --preset small --distill-from models/value_base.pt --data
 
 ## Still open
 
-- **`qaoa_random` optimality.** No solution ≤ 11.0 exists with depth ≤ 11
-  (proved). The watermark model, which encodes the order rule exactly, ran 30
-  minutes warm-started at 11.5 and finished FEASIBLE, not OPTIMAL: the
-  certified bound rose 5.0 -> **8.5** and the gap to 11.5 is now 3.0. An
-  80-minute rerun, again warm-started at 11.5, ended identically (FEASIBLE,
-  bound 8.5): more time does not move it. Closing the gap needs a tighter
-  formulation (symmetry breaking, stronger cuts), not a longer run.
 - **`dense_random` sat at ~37 under every non-learned method tried**:
   placement search + polish (60–300 s), whole-instance CP-SAT, window LNS,
   tail re-routing, longer paths, reverse-traversal seeding, per-core chains,
@@ -632,11 +722,11 @@ python -m qroute.train --preset small --distill-from models/value_base.pt --data
   ~11 min) — so the move set, not the placement, was the binding constraint.
   Its analytical floor (10.0) is still far too loose to say what remains.
 - **Tube LNS cannot improve the policy's solutions.** From 35.5 it found
-  nothing at radius 2, 4 or 3 (7.5 min), and `solve_long` (portfolio restarts
-  + tube rounds, 15 min, policy enabled inside each restart) returned 36.0 —
-  worse than a single 60 s policy run. The two methods plateau at nearly the
-  same place from different directions; making the tube escape a good
-  incumbent (more diverse starts, adaptive radius) is the live lever.
+  nothing at radius 2, 4 or 3 (7.5 min), and at 300 s restarts + tube tie
+  plain restarts (35.83 vs 35.67), so it is now opt-in. The typical 60 s
+  result has since improved through forward-backward refinement and best-of-3
+  parallel runs (~35.75), but the best single result is still the stored
+  35.0: every method now lands in 35.0–36.5 from different directions.
 - **The learned side of `dense_random` looks exhausted** at this net size and
   budget. Two follow-ups to round 2 were both flat:
   * *More data.* The policy retrained from scratch on 12.5 / 25 / 50 / 100 %

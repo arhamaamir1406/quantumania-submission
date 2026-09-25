@@ -66,8 +66,15 @@ def tube_lns(program, hw: nx.Graph, placement, routed, deadline: float,
 
 
 def solve_long(program, hw: nx.Graph, budget: float, restart_budget: float = 60.0,
-               exact_max_gates: int = 24, verbose: bool = False, **portfolio_kw):
-    """Portfolio restarts, each followed by tube LNS, within one budget.
+               exact_max_gates: int = 24, verbose: bool = False, use_tube: bool = False,
+               base_seed: int = 0xC0FFEE, **portfolio_kw):
+    """Portfolio restarts (optionally each followed by tube LNS) within one budget.
+
+    Restarts alone are the better use of the time: on dense_random a single
+    portfolio run plateaus by ~120 s (60 s: mean 38.0, 120 s: 37.0, 300 s:
+    37.0, the 300 s runs finishing early at ~248 s), and 300 s of restarts +
+    tube returned 38.0, while independent 60 s runs reach 35.0-35.5 within
+    8-16 tries. So `use_tube` is off by default.
 
     Small instances (the exact model already runs whole inside the portfolio)
     get a single portfolio run. Each restart uses a different seed, because the
@@ -84,10 +91,13 @@ def solve_long(program, hw: nx.Graph, budget: float, restart_budget: float = 60.
     restart = 0
     while True:
         left = deadline - time.monotonic()
-        if best is not None and left < restart_budget + 30:
+        # Without the tube a shorter final restart still helps; with it, the
+        # tube needs the room.
+        margin = restart_budget + 30 if use_tube else 0.5 * restart_budget
+        if best is not None and left < margin:
             break
         rb = max(1.0, min(restart_budget, left))
-        pl, rt = portfolio_solve(program, hw, budget=rb, seed=0xC0FFEE + restart,
+        pl, rt = portfolio_solve(program, hw, budget=rb, seed=base_seed + restart,
                                  verbose=False, **portfolio_kw)
         sc = score_summary(program, hw, pl, rt)["score"]
         if verbose:
@@ -96,8 +106,9 @@ def solve_long(program, hw: nx.Graph, budget: float, restart_budget: float = 60.
             best = (sc, pl, rt)
         if n2q <= exact_max_gates or sc <= floor:
             break
-        sc, pl, rt = tube_lns(program, hw, pl, rt, deadline, seed=restart, verbose=verbose)
-        if sc < best[0]:
-            best = (sc, pl, rt)
+        if use_tube:
+            sc, pl, rt = tube_lns(program, hw, pl, rt, deadline, seed=restart, verbose=verbose)
+            if sc < best[0]:
+                best = (sc, pl, rt)
         restart += 1
     return best[1], best[2]

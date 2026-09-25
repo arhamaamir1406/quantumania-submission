@@ -108,6 +108,53 @@ def _policy_fn(problem, path, device, verbose):
         return None
 
 
+def _fb_refine(problem, pvf, chosen, policy_path, device, lookahead, prune,
+               passes, deadline, offer):
+    """Forward-backward placement refinement under the policy router.
+
+    Returns the refined placements, best forward cost first (the originals are
+    kept as candidates too, so this can only add options)."""
+    from .mdp import Problem as _Problem
+    rev = _Problem(list(reversed(problem.program)), problem.hw)
+    bvf = _policy_fn(rev, policy_path, device, False)
+    if bvf is None:
+        return chosen
+
+    def route(P, vf, pl):
+        s = beam_search(P, P.initial(pl), width=16, lookahead=lookahead, prune=prune,
+                        prune_fn=vf, value_fn=vf, deadline=deadline)
+        if s is None:
+            return None, None, None
+        return s.cost, {P.logicals[i]: p for i, p in enumerate(s.pos)}, s
+
+    out = []
+    for tag, pl in chosen:
+        cur = pl
+        for k in range(passes):
+            if time.monotonic() > deadline:
+                break
+            _, end, _ = route(problem, pvf, cur)
+            if end is None:
+                break
+            _, back, _ = route(rev, bvf, end)
+            if back is None:
+                break
+            c, _, s = route(problem, pvf, back)
+            if c is None:
+                break
+            offer(back, s.ops(), f"fb{k}/{tag}")
+            out.append((c, f"fb{k}/{tag}", back))
+            cur = back
+    out.sort(key=lambda x: x[0])
+    seen, merged = set(), []
+    for _, tag, pl in out + [(0, t, p) for t, p in chosen]:
+        key = tuple(sorted(pl.items()))
+        if key not in seen:
+            seen.add(key)
+            merged.append((tag, pl))
+    return merged[:len(chosen) + 2]
+
+
 def solve(program: list[tuple], hardware_graph: nx.Graph, budget: float = 10.0,
           seeds: int = 48, beam_width: int = 1200, verbose: bool = False,
           net=None, net_device: str | None = None, net_quantile: int | None = None,
@@ -118,13 +165,22 @@ def solve(program: list[tuple], hardware_graph: nx.Graph, budget: float = 10.0,
           use_window: bool = False, window_share: float = 0.4, window_size: int = 12,
           use_sabre: bool = False, sabre_share: float = 0.08,
           use_policy: bool = True, policy_path: str = "models/policy_small_r2.pt",
-          policy_share: float = 0.5, policy_prune: int = 4, policy_lookahead: int = 4):
+          policy_share: float = 0.8, policy_prune: int = 4, policy_lookahead: int = 4,
+          policy_pool: int = 0, use_fb: bool = True, fb_passes: int = 3):
     """Returns (initial_placement, routed_program)."""
     t0 = time.monotonic()
     rng = random.Random(seed)
     problem = Problem(program, hardware_graph)
     best: Candidate | None = None
     floor = score_lower_bound(program, hardware_graph)[0]
+    # The learned stages only pay on a GPU. On CPU the policy is ~30x slower:
+    # both learned stages then cost score and overrun the budget
+    # (dense_random, 60 s, CPU only: 39.5 with them, 38.2 mean without, and
+    # 62 s vs 54 s). Without CUDA, drop them and give their time to polish.
+    if (use_policy or use_net) and net_device is None and \
+            not _pick_device(None).startswith("cuda"):
+        use_policy = use_net = False
+        polish_share = 0.97
     # Hand the back part of the budget to the exact model: whole-instance on
     # small programs, window LNS on large ones.
     if use_exact:
@@ -228,8 +284,47 @@ def solve(program: list[tuple], hardware_graph: nx.Graph, budget: float = 10.0,
         # policy net both prunes (each parent keeps its best few) and ranks.
         if pvf is not None:
             end = t0 + budget * polish_share
-            for w in (8, 16, 32, 64, 128, 256):
-                for tag, pl in top[:6]:
+            # Re-rank a wider pool by the policy itself. The heuristic router
+            # that ranks `top` disagrees with the policy router (dense_random:
+            # rank correlation 0.40, top-12 overlap 1/12), so its favourites
+            # are mostly the wrong ones to spend wide policy beams on.
+            chosen = top[:6]
+            if policy_pool > 0:
+                pool, pkeys = [], set()
+                for _, tag, pl in scored_placements:
+                    k = tuple(sorted(pl.items()))
+                    if k not in pkeys:
+                        pkeys.add(k)
+                        pool.append((tag, pl))
+                    if len(pool) >= policy_pool:
+                        break
+                ranked = []
+                for tag, pl in pool:
+                    if time.monotonic() > end:
+                        break
+                    s = beam_search(problem, problem.initial(pl), width=8,
+                                    lookahead=policy_lookahead, prune=policy_prune,
+                                    prune_fn=pvf, value_fn=pvf, deadline=end)
+                    if s is not None:
+                        ranked.append((s.cost, tag, pl))
+                        offer(pl, s.ops(), f"policy8r/{tag}")
+                ranked.sort(key=lambda x: x[0])
+                if ranked:
+                    chosen = [(tag, pl) for _, tag, pl in ranked[:6]]
+            if use_fb:
+                # SABRE-style forward-backward refinement, with the policy as
+                # router: route forward, route the reversed program from the
+                # final mapping, start again from where that ends. With the
+                # heuristic router it never helped; with the policy it improves
+                # every one of the placement search's top placements
+                # (dense_random: best 38.5 -> 36.5 at width 16).
+                chosen = _fb_refine(problem, pvf, chosen, policy_path, net_device,
+                                    policy_lookahead, policy_prune, fb_passes,
+                                    t0 + budget * placement_share
+                                    + (end - t0 - budget * placement_share) * 0.5,
+                                    offer)
+            for w in (16, 32, 64, 128, 256) if (policy_pool > 0 or use_fb) else (8, 16, 32, 64, 128, 256):
+                for tag, pl in chosen:
                     if time.monotonic() > end:
                         break
                     s = beam_search(problem, problem.initial(pl), width=w,
