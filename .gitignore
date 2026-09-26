@@ -7,3 +7,6 @@ runs/
 # collected training datasets (regenerable; checkpoints under models/ are NOT
 # ignored -- the trained weights are part of the submission)
 *.npz
+
+# Local submission bundle (slides, writeup, script) — not for GitHub
+Final_submission/
