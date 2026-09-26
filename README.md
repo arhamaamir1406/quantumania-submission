@@ -12,6 +12,10 @@ optimal** (`ghz_star`, `chain_trotter`, `ladder_trotter`, `qaoa_random`,
 `qaoa_random`'s 11.5 are stored in `results/`, checkable with
 `python -m qroute.verify results/*.json`.
 
+**Writeup:** [`docs/Quantumania_writeup.pdf`](docs/Quantumania_writeup.pdf) is a
+short, reviewer-friendly explanation of the approach and results; this README has
+the full detail.
+
 | benchmark | 2Q gates | baseline | ours | swaps | depth | floor | proven optimal |
 |---|---|---|---|---|---|---|---|
 | `ghz_star` | 7 | 14.0 | **6.5** | 2 | 9 | 6.5 | yes — coupled hub bound |
@@ -631,6 +635,7 @@ setup.sh                 venv + CUDA torch for a fresh Linux/NVIDIA box
   eval.py                benchmark harness
 starter_kit/             organisers' code, vendored unmodified
 results/                 best verified routings found offline
+docs/                    Quantumania_writeup.pdf: short writeup for reviewers
 tests/                   exact-model and LNS regression tests (pytest)
 ```
 
